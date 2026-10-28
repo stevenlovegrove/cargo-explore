@@ -772,9 +772,13 @@ impl App {
         let n = runs.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.run_sel = self.run_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.run_sel = (self.run_sel + 1).min(n.saturating_sub(1))
+            // Down from the last run goes on into the flags below.
+            KeyCode::Down | KeyCode::Char('j') if self.run_sel + 1 >= n => {
+                self.flag_sel = 0;
+                self.focus = Focus::Flags;
+                return Action::None;
             }
+            KeyCode::Down | KeyCode::Char('j') => self.run_sel += 1,
             KeyCode::Enter => return self.run_action(false),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('D') => {
                 if let (Some(ws), Some(t), Some(r)) = (&self.ws, self.selected(), runs.get(self.run_sel)) {
@@ -812,7 +816,12 @@ impl App {
             }
             KeyCode::PageUp if self.raw => self.raw_scroll = self.raw_scroll.saturating_sub(10),
             KeyCode::PageDown if self.raw => self.raw_scroll = self.raw_scroll.saturating_add(10),
-            KeyCode::Up | KeyCode::Char('k') => self.flag_sel = self.flag_sel.saturating_sub(1),
+            // Up from the first flag goes back into the runs above, on the last.
+            KeyCode::Up | KeyCode::Char('k') if self.flag_sel == 0 => {
+                self.run_sel = self.runs().len().saturating_sub(1);
+                self.focus = Focus::Runs;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.flag_sel -= 1,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.flag_sel = (self.flag_sel + 1).min(n.saturating_sub(1))
             }

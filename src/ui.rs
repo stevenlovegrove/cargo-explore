@@ -701,6 +701,14 @@ mod tests {
         assert_eq!(app.args.text, "");
         key(&mut app, KeyCode::Down);
         assert_eq!(app.args.text, "--loud");
+        // Down from the last run goes into the flags, and up comes back.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, crate::app::Focus::Flags);
+        assert_eq!(app.flag_sel, 0);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, crate::app::Focus::Runs);
+        assert_eq!(app.run_sel, 1);
+        assert_eq!(app.args.text, "--loud");
         key(&mut app, KeyCode::Left);
         assert_eq!(app.focus, crate::app::Focus::Targets);
 
