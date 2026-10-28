@@ -4,8 +4,10 @@
 //! move between the targets, their recent runs and their flags. Nothing is
 //! built or run unless asked: `h` and `u` build the target and read its
 //! `--help` or `-h`, and what they read is kept for the target in this
-//! worktree. Cmd-enter (or ctrl- or alt-enter, or `x`) runs at once with the
-//! arguments shown.
+//! worktree. Enter runs at once, from any pane, the command line shown at the
+//! bottom: the selected target with the args shown, which are those of its
+//! last run until changed. `e` edits the args. Terminals that cannot tell
+//! cmd-enter from enter (Terminal.app) then run on either.
 
 use crate::cargo::{BuildState, Target, Workspace, Worktree};
 use crate::help::{HelpInfo, Source};
@@ -646,7 +648,7 @@ impl App {
                 };
                 Some(Action::None)
             }
-            KeyCode::Char('i') | KeyCode::Char('a') => {
+            KeyCode::Char('e') | KeyCode::Char('i') | KeyCode::Char('a') => {
                 self.args.end();
                 self.focus = Focus::Args;
                 Some(Action::None)
@@ -721,8 +723,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.selected().is_some() {
-                    self.args.end();
-                    self.focus = Focus::Args;
+                    return self.run_action(false);
                 } else if self.ws.is_none() {
                     self.open_dir_picker();
                 }
@@ -766,11 +767,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.run_sel = (self.run_sel + 1).min(n.saturating_sub(1))
             }
-            KeyCode::Enter => {
-                self.args.end();
-                self.focus = Focus::Args;
-                return Action::None;
-            }
+            KeyCode::Enter => return self.run_action(false),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('D') => {
                 if let (Some(ws), Some(t), Some(r)) = (&self.ws, self.selected(), runs.get(self.run_sel)) {
                     let (root, k) = (ws.root.clone(), t.key());
@@ -816,16 +813,14 @@ impl App {
             }
             KeyCode::PageUp => self.flag_sel = self.flag_sel.saturating_sub(10),
             KeyCode::PageDown => self.flag_sel = (self.flag_sel + 10).min(n.saturating_sub(1)),
-            // Right and space add the flag and stay; enter adds it and edits.
-            KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter if !self.raw => {
+            // Right and space add the flag to the args.
+            KeyCode::Right | KeyCode::Char(' ') if !self.raw => {
                 let rows = self.flag_rows();
                 if let Some(ins) = rows.get(self.flag_sel).and_then(|r| r.insert.clone()) {
                     self.insert_arg(&ins);
                 }
-                if key.code == KeyCode::Enter {
-                    self.focus = Focus::Args;
-                }
             }
+            KeyCode::Enter => return self.run_action(false),
             KeyCode::Esc => self.focus = Focus::Targets,
             KeyCode::Left => self.focus = self.right_of_targets_back(),
             _ => return self.key_common(key).unwrap_or(Action::None),

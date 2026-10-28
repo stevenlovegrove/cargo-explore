@@ -41,22 +41,22 @@ State is in `<config dir>/cargo-explore/state.json` (override with `CARGO_EXPLOR
 ## Keys
 
 Up and down select; left and right move between the targets, their recent runs and
-their flags. Cmd-enter runs at once with the arguments shown, from anywhere.
+their flags. Enter (or cmd-enter) runs at once, from any pane, the command line
+shown at the bottom: the selected target, debug or release, with the args shown,
+which are those of its last run (in this worktree, else another) until changed.
 
 | Where    | Keys |
 |----------|------|
-| Anywhere | `cmd-enter` (also `ctrl-enter`, `alt-enter`, `F5`) run now |
-| Targets  | `↑↓` select · `→` runs, then flags · `enter` edit args · `x` run · `X` run as built · `h` read `--help` · `u` read `-h` · `w` worktree · `/` filter · `r` debug/release · `v` raw help · `R` reload · `d` directory · `q` quit |
-| Recent runs | `↑↓` choose (fills the args) · `←→` panes · `enter` edit · `del` forget |
-| Flags    | `↑↓` select · `→`/`space` add to args · `enter` add and edit · `←` back |
+| Anywhere | `enter`, `cmd-enter` (also `ctrl-enter`, `alt-enter`, `F5`, `x`) run the command shown |
+| Targets  | `↑↓` select · `→` runs, then flags · `e` edit args · `X` run as built · `h` read `--help` · `u` read `-h` · `w` worktree · `/` filter · `r` debug/release · `v` raw help · `R` reload · `d` directory · `q` quit |
+| Recent runs | `↑↓` choose (fills the args) · `←→` panes · `e` edit · `del` forget |
+| Flags    | `↑↓` select · `→`/`space` add to args · `e` edit args · `←` back |
 | Args     | `enter` run · `tab` complete a flag · `↑↓` recent runs · `ctrl-a/e/u/k/w` editing · `esc` back |
 | Worktrees | `↑↓` select · `enter`/`→` open · `esc`/`←` cancel |
 | Directory picker | type a path (`tab` completes) or filter recent dirs · `enter` open |
 
-Cmd-enter reaches the program only in a terminal that reports it, by the kitty
-keyboard protocol: kitty, WezTerm, Ghostty, or iTerm2 with "Report keys using CSI u"
-on. Some bind it themselves (iTerm2 and Ghostty to full screen); there, use
-`alt-enter` or `x`.
+Text is drawn in the terminal's own colours, with no greys, so that it reads on a
+light or a dark background alike.
 
 ## Non-interactive
 

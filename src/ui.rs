@@ -37,7 +37,7 @@ fn circle(b: Option<&BuildState>) -> Span<'static> {
     match b {
         Some(b @ BuildState::Fresh) => b.circle().green(),
         Some(b @ BuildState::Stale(_)) => b.circle().yellow(),
-        Some(b) => b.circle().dark_gray(),
+        Some(b) => b.circle().into(),
         None => " ".into(),
     }
 }
@@ -66,9 +66,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_detail(f, app, right);
     draw_args(f, app, args);
 
+    // What enter runs, always: the selected target with the args shown and
+    // the profile chosen.
     if let Some(c) = app.command_preview() {
         f.render_widget(
-            Paragraph::new(Line::from(vec![" $ ".dark_gray(), Span::raw(c).gray()])),
+            Paragraph::new(Line::from(vec![" ⏎ $ ".fg(ACCENT).bold(), c.bold()])),
             cmd,
         );
     }
@@ -93,13 +95,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     ];
     if let Some(ws) = &app.ws {
         if ws.root != app.dir {
-            spans.push(format!("  (workspace {})", ws.root.display()).dark_gray());
+            spans.push(format!("  (workspace {})", ws.root.display()).italic());
         }
     }
     if let Some(w) = &app.worktree {
         spans.push(format!("  ⎇ {}", w.label()).magenta());
         if app.worktree_count > 1 {
-            spans.push(format!(" ({} worktrees)", app.worktree_count).dark_gray());
+            spans.push(format!(" ({} worktrees)", app.worktree_count).italic());
         }
     }
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(9)]).areas(area);
@@ -154,7 +156,7 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(format!("{:<name_w$}", t.name)),
             ];
             if multi {
-                spans.push(format!("  {}", t.package).dark_gray());
+                spans.push(format!("  {}", t.package).italic());
             }
             ListItem::new(Line::from(spans))
         })
@@ -191,10 +193,10 @@ fn build_line(app: &App) -> Line<'static> {
                 })
                 .collect();
             spans.push(format!("built ({profile}), changed since: ").yellow());
-            spans.push(names.join(", ").dark_gray());
-            spans.push("  · x cargo run · X run as built".dark_gray());
+            spans.push(names.join(", ").italic());
+            spans.push("  · x cargo run · X run as built".italic());
         }
-        _ => spans.push(format!("not built ({profile})").dark_gray()),
+        _ => spans.push(format!("not built ({profile})").italic()),
     }
     Line::from(spans)
 }
@@ -211,7 +213,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let mut info: Vec<Line> = Vec::new();
     let mut head = vec![
         t.name.clone().bold(),
-        format!("  {} of {}", t.kind.label(), t.package).dark_gray(),
+        format!("  {} of {}", t.kind.label(), t.package).italic(),
     ];
     if !t.required_features.is_empty() {
         head.push(format!("  needs features: {}", t.required_features.join(",")).yellow());
@@ -221,9 +223,9 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let src = root
         .and_then(|r| t.src_path.strip_prefix(r).ok())
         .unwrap_or(&t.src_path);
-    let mut src_line = vec![src.display().to_string().dark_gray()];
+    let mut src_line = vec![src.display().to_string().italic()];
     if let Some(p) = app.parser() {
-        src_line.push("  · parser: ".dark_gray());
+        src_line.push("  · parser: ".italic());
         src_line.push(p.to_string().into());
     }
     info.push(Line::from(src_line));
@@ -234,7 +236,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         }
         if !h.usage.is_empty() {
             info.push(Line::from(vec![
-                "Usage: ".dark_gray(),
+                "Usage: ".italic(),
                 Span::raw(h.usage.clone()),
             ]));
         }
@@ -266,14 +268,14 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     } else {
         match &help {
             Some((h, Origin::Kept { updated, other: None })) => Line::from(vec![
-                format!(" {} · ", h.source.label()).dark_gray(),
-                format!("updated {} ", ago(*updated)).gray(),
+                format!(" {} · ", h.source.label()).italic(),
+                format!("updated {} ", ago(*updated)).into(),
             ]),
             Some((h, Origin::Kept { updated, other: Some(o) })) => Line::from(vec![
-                format!(" {} · ", h.source.label()).dark_gray(),
+                format!(" {} · ", h.source.label()).italic(),
                 format!("from {} {} · h to refresh ", short(o), ago(*updated)).yellow(),
             ]),
-            _ => Line::from(" source scan · h --help · u -h ".dark_gray()),
+            _ => Line::from(" source scan · h --help · u -h ".italic()),
         }
     };
     let corner = corner.right_aligned();
@@ -312,7 +314,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
                         Color::Reset
                     }),
                     "  ".into(),
-                    r.desc.clone().gray(),
+                    r.desc.clone().into(),
                 ]))
             })
             .collect();
@@ -324,7 +326,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 "no flags found · h reads --help, u reads -h (builds the target)"
             };
-            f.render_widget(Paragraph::new(msg.dark_gray()).block(block), flags_area);
+            f.render_widget(Paragraph::new(msg.italic()).block(block), flags_area);
         } else {
             let list = List::new(items)
                 .block(block)
@@ -341,11 +343,11 @@ fn draw_runs(f: &mut Frame, app: &App, runs: &[crate::state::RunView], area: Rec
         .iter()
         .map(|r| {
             let mut spans = vec![if r.args.is_empty() {
-                "(no args)".dark_gray()
+                "(no args)".italic()
             } else {
                 Span::raw(r.args.clone())
             }];
-            spans.push(format!("  {}", ago(r.when)).dark_gray());
+            spans.push(format!("  {}", ago(r.when)).italic());
             if let Some(o) = &r.other {
                 spans.push(format!("  in {}", short(o)).yellow());
             }
@@ -355,7 +357,7 @@ fn draw_runs(f: &mut Frame, app: &App, runs: &[crate::state::RunView], area: Rec
     let block = pane(format!(" Recent runs ({}) ", runs.len()), focused);
     if items.is_empty() {
         f.render_widget(
-            Paragraph::new("none yet · cmd-enter or x runs with the args below".dark_gray())
+            Paragraph::new("none yet · ⏎ runs the command below".italic())
                 .block(block),
             area,
         );
@@ -373,7 +375,7 @@ fn draw_args(f: &mut Frame, app: &App, area: Rect) {
     let block = pane(" Args ".into(), focused);
     let inner = block.inner(area);
     let text = if app.args.text.is_empty() && !focused {
-        Line::from("enter to edit · cmd-enter runs now".dark_gray())
+        Line::from("none · e to edit · ⏎ runs the command below".italic())
     } else {
         Line::from(app.args.text.clone())
     };
@@ -394,9 +396,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Focus::Targets => &[
                 ("↑↓", "select"),
                 ("→", "runs, flags"),
-                ("⌘⏎/x", "run"),
+                ("⏎", "run"),
                 ("X", "run as built"),
-                ("enter", "edit args"),
+                ("e", "edit args"),
                 ("h/u", "read --help/-h"),
                 ("w", "worktree"),
                 ("/", "filter"),
@@ -408,16 +410,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Focus::Runs => &[
                 ("↑↓", "choose args"),
                 ("←→", "panes"),
-                ("⌘⏎/x", "run"),
-                ("enter", "edit"),
+                ("⏎", "run"),
+                ("e", "edit"),
                 ("del", "forget"),
             ],
             Focus::Flags => &[
                 ("↑↓", "select"),
                 ("→/space", "add to args"),
-                ("enter", "add and edit"),
                 ("←", "back"),
-                ("⌘⏎/x", "run"),
+                ("⏎", "run"),
+                ("e", "edit args"),
                 ("v", "raw help"),
             ],
             Focus::Args => &[
@@ -437,8 +439,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         };
         let mut spans = vec![Span::raw(" ")];
         for (k, d) in hints {
-            spans.push(k.to_string().fg(ACCENT).bold());
-            spans.push(format!(" {d}  ").dark_gray());
+            spans.push(k.to_string().bold().reversed());
+            spans.push(format!(" {d}  ").into());
         }
         Line::from(spans)
     };
@@ -477,7 +479,7 @@ fn draw_dir_picker(f: &mut Frame, app: &App) {
         input,
     );
     f.render_widget(
-        Paragraph::new("Recent directories (type a path, or filter this list)".dark_gray()),
+        Paragraph::new("Recent directories (type a path, or filter this list)".italic()),
         hint,
     );
     let items: Vec<ListItem> = app
@@ -519,7 +521,7 @@ fn draw_worktrees(f: &mut Frame, app: &App) {
                 format!("  {}", r.worktree.root.display()).into(),
             ];
             if r.runs > 0 {
-                spans.push(format!("  {} runs", r.runs).dark_gray());
+                spans.push(format!("  {} runs", r.runs).italic());
             }
             if r.current {
                 spans.push("  (here)".fg(ACCENT));
@@ -650,6 +652,10 @@ mod tests {
         assert_eq!(a.last().unwrap(), "--loud");
         let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
         assert!(matches!(app.handle_key(alt_enter), Action::Run { .. }));
+        // Plain enter runs too, from the flags, and the command is shown.
+        let a = argv(key(&mut app, KeyCode::Enter));
+        assert_eq!(a.last().unwrap(), "--loud");
+        assert!(screen(&app).contains("⏎ $ cargo run -p demo --example hello -- --loud"));
 
         // The run is recorded; left goes back to it, and up/down choose args.
         key(&mut app, KeyCode::Left);
