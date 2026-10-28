@@ -33,7 +33,8 @@ cargo-explore            # or: cargo explore, or: cargo-explore path/to/project
   has the selected target, with whether it is built in each, and opens one.
 - **Runs** `cargo run -p <pkg> --bin|--example <name> [--release] -- <args>`, or with
   `X` the executable as it was last built, with no build, in the directory you
-  started in, handing over the terminal, then returns to the UI.
+  started in. The explorer becomes the program (an exec): nothing of it is left
+  or printed once the program ends.
 
 State is in `<config dir>/cargo-explore/state.json` (override with `CARGO_EXPLORE_STATE`).
 

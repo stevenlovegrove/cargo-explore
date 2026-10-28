@@ -16,7 +16,6 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::{execute, terminal};
 use ratatui::DefaultTerminal;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
@@ -89,10 +88,6 @@ fn main() -> Result<()> {
         return describe(&dir, &name, cli.no_build);
     }
 
-    // Keep the explorer alive when the user hits Ctrl-C in a program it runs;
-    // the child still gets the signal because handlers reset on exec.
-    let _ = ctrlc::set_handler(|| {});
-
     let state = state::State::load(state::default_path());
     let (req_tx, req_rx) = mpsc::channel();
     let (resp_tx, resp_rx) = mpsc::channel();
@@ -103,14 +98,31 @@ fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app, &resp_rx);
     restore_terminal();
     app.state.save();
-    result
+    match result? {
+        Action::Run { argv, env } => launch(&app.dir, &argv, &env),
+        _ => Ok(()),
+    }
 }
 
+/// Becomes the program: the explorer's process is replaced by it, so that
+/// nothing of the explorer is left or said once it ends.
+fn launch(dir: &std::path::Path, argv: &[String], env: &[(String, String)]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let err = Command::new(&argv[0])
+        .args(&argv[1..])
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .current_dir(dir)
+        .exec();
+    bail!("could not start {}: {err}", argv[0])
+}
+
+/// Runs the UI until the user quits or chooses a program to launch, and
+/// returns which.
 fn run(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     responses: &mpsc::Receiver<app::Response>,
-) -> Result<()> {
+) -> Result<Action> {
     loop {
         while let Ok(r) = responses.try_recv() {
             app.on_response(r);
@@ -127,40 +139,9 @@ fn run(
         }
         match app.handle_key(key) {
             Action::None => {}
-            Action::Quit => return Ok(()),
-            Action::Run { argv, env } => {
-                restore_terminal();
-                let quit = run_foreground(app, &argv, &env);
-                *terminal = init_terminal();
-                app.after_run();
-                if quit {
-                    return Ok(());
-                }
-            }
+            done => return Ok(done),
         }
     }
-}
-
-/// Runs the command with the terminal handed over, then waits for the user.
-/// Returns true if the user asked to quit.
-fn run_foreground(app: &mut App, argv: &[String], env: &[(String, String)]) -> bool {
-    let shown = shlex::try_join(argv.iter().map(String::as_str)).unwrap_or_else(|_| argv.join(" "));
-    println!("\x1b[1;36m$ {shown}\x1b[0m   (in {})", app.dir.display());
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&app.dir)
-        .status();
-    let summary = match status {
-        Ok(s) if s.success() => "\x1b[32mexited successfully\x1b[0m".to_string(),
-        Ok(s) => format!("\x1b[31m{s}\x1b[0m"),
-        Err(e) => format!("\x1b[31mfailed to start: {e}\x1b[0m"),
-    };
-    print!("\n{summary} · press Enter to return to cargo-explore, or q + Enter to quit ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
-    line.trim() == "q"
 }
 
 fn describe(dir: &std::path::Path, name: &str, no_build: bool) -> Result<()> {

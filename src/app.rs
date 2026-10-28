@@ -486,11 +486,6 @@ impl App {
         Action::Run { argv, env }
     }
 
-    /// After a run, which may have built the target.
-    pub fn after_run(&mut self) {
-        self.refresh_selected_build();
-    }
-
     pub fn dir_candidates(&self) -> Vec<PathBuf> {
         let needle = self.dir_input.text.to_lowercase();
         self.state

@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
 dirs = "6"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
