@@ -32,7 +32,7 @@ cargo-explore            # or: cargo explore, or: cargo-explore path/to/project
 - **Switches worktree**: `w` lists the git worktrees whose copy of the workspace
   has the selected target, with whether it is built in each, and opens one.
 - **Runs** `cargo run -p <pkg> --bin|--example <name> [--release] -- <args>`, or with
-  `X` the executable as it was last built, with no build, in the directory you
+  `x` the executable as it was last built, with no build, in the directory you
   started in. The explorer becomes the program (an exec): nothing of it is left
   or printed once the program ends.
 
@@ -47,16 +47,16 @@ which are those of its last run (in this worktree, else another) until changed.
 
 | Where    | Keys |
 |----------|------|
-| Anywhere | `enter`, `cmd-enter` (also `ctrl-enter`, `alt-enter`, `F5`, `x`) run the command shown |
-| Targets  | `↑↓` select · `→` runs, then flags · `e` edit args · `X` run as built · `h` read `--help` · `u` read `-h` · `w` worktree · `/` filter · `r` debug/release · `v` raw help · `R` reload · `d` directory · `q` quit |
+| Anywhere | `enter`, `cmd-enter` (also `ctrl-enter`, `alt-enter`, `F5`, `X`) run the command shown, by `cargo run` |
+| Targets  | `↑↓` select · `→` runs, then flags · `e` edit args · `x` run the executable as built, with no build · `h` read `--help` · `u` read `-h` · `w` worktree · `/` filter · `r` debug/release · `v` raw help · `R` reload · `d` directory · `q` quit |
 | Runs     | `↑↓` choose (fills the args; the first is always no args) · `←→` panes · `e` edit · `del` forget |
 | Flags    | `↑↓` select · `→`/`space` add to args · `e` edit args · `←` back |
 | Args     | `enter` run · `tab` complete a flag · `↑↓` recent runs · `ctrl-a/e/u/k/w` editing · `esc` back |
 | Worktrees | `↑↓` select · `enter`/`→` open · `esc`/`←` cancel |
 | Directory picker | type a path (`tab` completes) or filter recent dirs · `enter` open |
 
-Text is drawn in the terminal's own colours, with no greys, so that it reads on a
-light or a dark background alike.
+It draws with a palette of its own, background included, from the 256 colours that
+every terminal has, so that it reads the same whatever the terminal's colours are.
 
 ## Non-interactive
 

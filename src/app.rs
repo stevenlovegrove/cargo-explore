@@ -483,7 +483,7 @@ impl App {
             let exe = t.exe_path(&ws.target_dir, self.state.release);
             if !exe.is_file() {
                 self.status = Some(format!(
-                    "not built in {}; x runs it by cargo run",
+                    "not built in {}; enter or X runs it by cargo run",
                     if self.state.release { "release" } else { "debug" }
                 ));
                 return Action::None;
@@ -671,8 +671,8 @@ impl App {
                 self.focus = Focus::Args;
                 Some(Action::None)
             }
-            KeyCode::Char('x') => Some(self.run_action(false)),
-            KeyCode::Char('X') => Some(self.run_action(true)),
+            KeyCode::Char('X') => Some(self.run_action(false)),
+            KeyCode::Char('x') => Some(self.run_action(true)),
             KeyCode::Char('r') => {
                 self.state.release = !self.state.release;
                 self.state.save();

@@ -10,7 +10,24 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Frame;
 use std::path::Path;
 
-const ACCENT: Color = Color::Cyan;
+// Our own palette, background too, from the 256 colours that every terminal
+// has (Terminal.app among them), so that what is drawn reads the same
+// whatever the terminal's own colours are.
+const BG: Color = Color::Indexed(234);
+const FG: Color = Color::Indexed(253);
+const DIM: Color = Color::Indexed(244);
+const ACCENT: Color = Color::Indexed(81);
+const GREEN: Color = Color::Indexed(114);
+const YELLOW: Color = Color::Indexed(221);
+const MAGENTA: Color = Color::Indexed(176);
+const BLUE: Color = Color::Indexed(111);
+const RED: Color = Color::Indexed(203);
+
+/// Fills an area with our background and foreground, for what is drawn on it.
+fn fill(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    f.render_widget(Block::new().style(Style::new().bg(BG).fg(FG)), area);
+}
 
 fn pane(title: String, focused: bool) -> Block<'static> {
     let block = Block::bordered()
@@ -21,13 +38,13 @@ fn pane(title: String, focused: bool) -> Block<'static> {
             .border_style(Style::new().fg(ACCENT))
             .title_style(Style::new().fg(ACCENT).bold())
     } else {
-        block.border_style(Style::new().dark_gray())
+        block.border_style(Style::new().fg(DIM))
     }
 }
 
 fn highlight(focused: bool) -> Style {
     if focused {
-        Style::new().bg(ACCENT).fg(Color::Black).bold()
+        Style::new().bg(ACCENT).fg(BG).bold()
     } else {
         Style::new().add_modifier(Modifier::REVERSED)
     }
@@ -35,8 +52,8 @@ fn highlight(focused: bool) -> Style {
 
 fn circle(b: Option<&BuildState>) -> Span<'static> {
     match b {
-        Some(b @ BuildState::Fresh) => b.circle().green(),
-        Some(b @ BuildState::Stale(_)) => b.circle().yellow(),
+        Some(b @ BuildState::Fresh) => b.circle().fg(GREEN),
+        Some(b @ BuildState::Stale(_)) => b.circle().fg(YELLOW),
         Some(b) => b.circle().into(),
         None => " ".into(),
     }
@@ -59,6 +76,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     ])
     .areas(f.area());
 
+    fill(f, f.area());
     draw_header(f, app, header);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(main);
@@ -85,9 +103,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let profile = if app.state.release {
-        " release ".black().on_yellow()
+        " release ".fg(BG).bg(YELLOW)
     } else {
-        " debug ".black().on_green()
+        " debug ".fg(BG).bg(GREEN)
     };
     let mut spans = vec![
         " cargo-explore ".bold().fg(ACCENT),
@@ -99,7 +117,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     if let Some(w) = &app.worktree {
-        spans.push(format!("  ⎇ {}", w.label()).magenta());
+        spans.push(format!("  ⎇ {}", w.label()).fg(MAGENTA));
         if app.worktree_count > 1 {
             spans.push(format!(" ({} worktrees)", app.worktree_count).italic());
         }
@@ -123,7 +141,7 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
         let p = Paragraph::new(vec![
             Line::from("No Cargo project here.".bold()),
             Line::from(""),
-            Line::from(msg.red()),
+            Line::from(msg.fg(RED)),
             Line::from(""),
             Line::from("Press d to pick another directory."),
         ])
@@ -146,8 +164,8 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
         .map(|&i| {
             let t = &ws.targets[i];
             let kind = match t.kind {
-                crate::cargo::Kind::Bin => "bin ".green(),
-                crate::cargo::Kind::Example => "ex  ".magenta(),
+                crate::cargo::Kind::Bin => "bin ".fg(GREEN),
+                crate::cargo::Kind::Example => "ex  ".fg(MAGENTA),
             };
             let mut spans = vec![
                 circle(app.builds.get(&t.key())),
@@ -180,7 +198,7 @@ fn build_line(app: &App) -> Line<'static> {
     let b = app.selected_build();
     let mut spans = vec![circle(b), " ".into()];
     match b {
-        Some(BuildState::Fresh) => spans.push(format!("built, up to date ({profile})").green()),
+        Some(BuildState::Fresh) => spans.push(format!("built, up to date ({profile})").fg(GREEN)),
         Some(BuildState::Stale(newer)) => {
             let root = app.ws.as_ref().map(|w| w.root.as_path());
             let names: Vec<String> = newer
@@ -192,9 +210,9 @@ fn build_line(app: &App) -> Line<'static> {
                         .to_string()
                 })
                 .collect();
-            spans.push(format!("built ({profile}), changed since: ").yellow());
+            spans.push(format!("built ({profile}), changed since: ").fg(YELLOW));
             spans.push(names.join(", ").italic());
-            spans.push("  · x cargo run · X run as built".italic());
+            spans.push("  · ⏎ cargo run · x run as built".italic());
         }
         _ => spans.push(format!("not built ({profile})").italic()),
     }
@@ -216,7 +234,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         format!("  {} of {}", t.kind.label(), t.package).italic(),
     ];
     if !t.required_features.is_empty() {
-        head.push(format!("  needs features: {}", t.required_features.join(",")).yellow());
+        head.push(format!("  needs features: {}", t.required_features.join(",")).fg(YELLOW));
     }
     info.push(Line::from(head));
     let root = app.ws.as_ref().map(|w| w.root.as_path());
@@ -241,7 +259,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             ]));
         }
         if let Some(n) = &h.note {
-            info.push(Line::from(n.clone().yellow()));
+            info.push(Line::from(n.clone().fg(YELLOW)));
         }
     }
     let info_h = (info.len() as u16 + 1).min(area.height / 3).max(4);
@@ -264,7 +282,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     // Flags pane (or raw help text), with where its flags are from in the corner.
     let focused = app.focus == Focus::Flags;
     let corner: Line = if app.is_reading() {
-        Line::from(" building and reading… ".yellow())
+        Line::from(" building and reading… ".fg(YELLOW))
     } else {
         match &help {
             Some((h, Origin::Kept { updated, other: None })) => Line::from(vec![
@@ -273,7 +291,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             ]),
             Some((h, Origin::Kept { updated, other: Some(o) })) => Line::from(vec![
                 format!(" {} · ", h.source.label()).italic(),
-                format!("from {} {} · h to refresh ", short(o), ago(*updated)).yellow(),
+                format!("from {} {} · h to refresh ", short(o), ago(*updated)).fg(YELLOW),
             ]),
             _ => Line::from(" source scan · h --help · u -h ".italic()),
         }
@@ -302,16 +320,16 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             .iter()
             .map(|r| {
                 let kind = match r.kind {
-                    "cmd" => "cmd  ".blue(),
-                    "arg" => "arg  ".magenta(),
+                    "cmd" => "cmd  ".fg(BLUE),
+                    "arg" => "arg  ".fg(MAGENTA),
                     _ => "     ".into(),
                 };
                 ListItem::new(Line::from(vec![
                     kind,
                     format!("{:<spec_w$}", r.spec).fg(if r.kind == "flag" {
-                        Color::Green
+                        GREEN
                     } else {
-                        Color::Reset
+                        FG
                     }),
                     "  ".into(),
                     r.desc.clone().into(),
@@ -351,7 +369,7 @@ fn draw_runs(f: &mut Frame, app: &App, runs: &[crate::state::RunView], area: Rec
                 spans.push(format!("  {}", ago(r.when)).italic());
             }
             if let Some(o) = &r.other {
-                spans.push(format!("  in {}", short(o)).yellow());
+                spans.push(format!("  in {}", short(o)).fg(YELLOW));
             }
             ListItem::new(Line::from(spans))
         })
@@ -385,14 +403,14 @@ fn draw_args(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = if let Some(s) = &app.status {
-        Line::from(format!(" {s}").yellow())
+        Line::from(format!(" {s}").fg(YELLOW))
     } else {
         let hints: &[(&str, &str)] = match app.focus {
             Focus::Targets => &[
                 ("↑↓", "select"),
                 ("→", "runs, flags"),
                 ("⏎", "run"),
-                ("X", "run as built"),
+                ("x", "run as built"),
                 ("e", "edit args"),
                 ("h/u", "read --help/-h"),
                 ("w", "worktree"),
@@ -456,7 +474,7 @@ fn popup_area(f: &Frame) -> Rect {
 
 fn draw_dir_picker(f: &mut Frame, app: &App) {
     let popup = popup_area(f);
-    f.render_widget(Clear, popup);
+    fill(f, popup);
     let block = pane(" Switch directory ".into(), true);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -495,7 +513,7 @@ fn draw_dir_picker(f: &mut Frame, app: &App) {
 
 fn draw_worktrees(f: &mut Frame, app: &App) {
     let popup = popup_area(f);
-    f.render_widget(Clear, popup);
+    fill(f, popup);
     let name = app.selected().map(|t| t.name.clone()).unwrap_or_default();
     let block = pane(format!(" Worktrees that have {name} "), true);
     let label_w = app
@@ -512,7 +530,7 @@ fn draw_worktrees(f: &mut Frame, app: &App) {
             let mut spans = vec![
                 circle(Some(&r.build)),
                 " ".into(),
-                format!("{:<label_w$}", r.worktree.label()).magenta(),
+                format!("{:<label_w$}", r.worktree.label()).fg(MAGENTA),
                 format!("  {}", r.worktree.root.display()).into(),
             ];
             if r.runs > 0 {
@@ -604,6 +622,18 @@ mod tests {
         s
     }
 
+    /// Every cell is drawn on a background and in a foreground of ours, none
+    /// left to the terminal's.
+    fn all_ours(app: &App) -> bool {
+        let mut t = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        t.backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|c| c.bg != Color::Reset && c.fg != Color::Reset)
+    }
+
     fn key(app: &mut App, code: KeyCode) -> Action {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
@@ -629,6 +659,7 @@ mod tests {
         assert!(s.contains("--fast"), "{s}");
         assert!(s.contains("source scan"), "{s}");
         assert!(s.contains("⎇ main"), "{s}");
+        assert!(all_ours(&app), "a cell is left in the terminal's colours");
         assert!(rx.try_recv().is_err());
 
         // Down to the example; right to its runs, where a run with no args is
@@ -673,8 +704,8 @@ mod tests {
         key(&mut app, KeyCode::Left);
         assert_eq!(app.focus, crate::app::Focus::Targets);
 
-        // X runs as built, which it is not.
-        assert!(matches!(key(&mut app, KeyCode::Char('X')), Action::None));
+        // x runs as built, which it is not.
+        assert!(matches!(key(&mut app, KeyCode::Char('x')), Action::None));
         assert!(app.status.as_deref().unwrap().contains("not built"));
 
         // h asks the worker for --help; what comes back is kept, with its date.
@@ -702,6 +733,7 @@ mod tests {
         // w lists both worktrees; switching keeps the target, and what was
         // kept in the first stands in, marked as from there.
         key(&mut app, KeyCode::Char('w'));
+        assert!(all_ours(&app), "the worktree popup leaves a cell in the terminal's colours");
         assert_eq!(app.focus, crate::app::Focus::Worktrees);
         assert_eq!(app.wt_rows.len(), 2);
         let s = screen(&app);
