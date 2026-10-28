@@ -1,7 +1,9 @@
 //! Parsing `--help` output of typical Rust command line programs (clap 2/3/4,
 //! structopt, argh, getopts, pico-args style hand-written usage text).
 
-#[derive(Clone, Debug, Default, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Flag {
     pub short: Option<String>,
     pub long: Option<String>,
@@ -35,20 +37,34 @@ impl Flag {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub name: String,
     pub desc: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
+    /// The program's `--help`.
     #[default]
     Help,
+    /// The program's `-h`, which clap gives as the short form.
+    Usage,
     SourceScan,
 }
 
-#[derive(Clone, Debug, Default)]
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Help => "--help",
+            Source::Usage => "-h",
+            Source::SourceScan => "source scan",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HelpInfo {
     pub about: String,
     pub usage: String,

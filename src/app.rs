@@ -1,11 +1,18 @@
 //! Application state and key handling.
+//!
+//! The arrow keys explore: up and down select within a pane, left and right
+//! move between the targets, their recent runs and their flags. Nothing is
+//! built or run unless asked: `h` and `u` build the target and read its
+//! `--help` or `-h`, and what they read is kept for the target in this
+//! worktree. Cmd-enter (or ctrl- or alt-enter, or `x`) runs at once with the
+//! arguments shown.
 
-use crate::cargo::{Target, Workspace};
+use crate::cargo::{BuildState, Target, Workspace, Worktree};
 use crate::help::{HelpInfo, Source};
 use crate::input::LineInput;
-use crate::state::State;
+use crate::state::{RunView, State};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
@@ -13,32 +20,35 @@ use std::sync::mpsc::Sender;
 pub enum Focus {
     Targets,
     Filter,
+    Runs,
     Flags,
-    History,
     Args,
     DirPicker,
+    Worktrees,
 }
 
-pub enum HelpState {
-    Loading,
-    Ready(HelpInfo),
-}
-
+/// A request to build a target and read its `--help` (Help) or `-h` (Usage).
 pub struct Request {
     pub key: String,
     pub root: PathBuf,
     pub target: Target,
+    pub release: bool,
+    pub mode: Source,
 }
 
-pub enum Response {
-    Done(String, HelpInfo),
-    Skipped(String),
+pub struct Response {
+    pub key: String,
+    pub root: PathBuf,
+    pub info: HelpInfo,
 }
 
 pub enum Action {
     None,
     Quit,
-    Run(Vec<String>),
+    Run {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    },
 }
 
 /// One row of the flags pane.
@@ -48,6 +58,23 @@ pub struct FlagRow {
     pub desc: String,
     /// Text inserted into the args line when chosen.
     pub insert: Option<String>,
+}
+
+/// Where the flags shown came from.
+pub enum Origin {
+    /// Scanned from the source just now.
+    Scan,
+    /// Read from the program, kept; `other` is the worktree it was read in,
+    /// if not this one.
+    Kept { updated: u64, other: Option<PathBuf> },
+}
+
+/// One row of the worktree picker.
+pub struct WorktreeRow {
+    pub worktree: Worktree,
+    pub build: BuildState,
+    pub current: bool,
+    pub runs: usize,
 }
 
 pub struct App {
@@ -60,18 +87,26 @@ pub struct App {
     pub sel: usize,
     pub args: LineInput,
     pub flag_sel: usize,
-    pub hist_sel: usize,
+    pub run_sel: usize,
     hist_nav: Option<usize>,
     pub raw: bool,
     pub raw_scroll: u16,
-    pub helps: HashMap<String, HelpState>,
-    scans: HashMap<String, HelpInfo>,
+    /// Target keys whose `--help` is being read, in this workspace.
+    pub reading: HashSet<String>,
+    scans: HashMap<String, (HelpInfo, &'static str)>,
+    /// Build states of this workspace's targets, for the profile chosen.
+    pub builds: HashMap<String, BuildState>,
     pub state: State,
     tx: Sender<Request>,
     pub status: Option<String>,
     pub dir_input: LineInput,
     pub dir_sel: usize,
     selected_key: Option<String>,
+    /// The worktree this workspace is in, if it is in git.
+    pub worktree: Option<Worktree>,
+    pub worktree_count: usize,
+    pub wt_rows: Vec<WorktreeRow>,
+    pub wt_sel: usize,
 }
 
 impl App {
@@ -86,18 +121,23 @@ impl App {
             sel: 0,
             args: LineInput::default(),
             flag_sel: 0,
-            hist_sel: 0,
+            run_sel: 0,
             hist_nav: None,
             raw: false,
             raw_scroll: 0,
-            helps: HashMap::new(),
+            reading: HashSet::new(),
             scans: HashMap::new(),
+            builds: HashMap::new(),
             state,
             tx,
             status: None,
             dir_input: LineInput::default(),
             dir_sel: 0,
             selected_key: None,
+            worktree: None,
+            worktree_count: 0,
+            wt_rows: Vec::new(),
+            wt_sel: 0,
         };
         app.load_dir(&dir);
         app
@@ -106,16 +146,21 @@ impl App {
     pub fn load_dir(&mut self, dir: &Path) {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         self.dir = dir.clone();
-        self.helps.clear();
+        self.reading.clear();
         self.scans.clear();
         self.selected_key = None;
         self.filter.clear();
         self.sel = 0;
+        self.worktree = None;
+        self.worktree_count = 0;
         match crate::cargo::discover(&dir) {
             Ok(ws) => {
                 self.state.push_dir(&dir);
                 self.state.save();
                 self.error = None;
+                let wts = crate::cargo::worktrees(&ws.root);
+                self.worktree_count = wts.len();
+                self.worktree = wts.into_iter().find(|w| w.root == ws.root);
                 self.ws = Some(ws);
             }
             Err(e) => {
@@ -123,19 +168,42 @@ impl App {
                 self.error = Some(e.to_string());
             }
         }
+        self.refresh_builds();
         self.refilter();
-        if let Some(ws) = &self.ws {
-            if let Some(last) = self.state.last_target(&ws.root) {
-                if let Some(pos) = self
-                    .visible
-                    .iter()
-                    .position(|&i| ws.targets[i].key() == last)
-                {
-                    self.sel = pos;
-                }
-            }
+        let last = self
+            .ws
+            .as_ref()
+            .and_then(|ws| self.state.last_target(&ws.root))
+            .map(String::from);
+        if let Some(last) = last {
+            self.select_key(&last);
         }
         self.on_select();
+    }
+
+    fn select_key(&mut self, key: &str) {
+        if let Some(ws) = &self.ws {
+            if let Some(pos) = self.visible.iter().position(|&i| ws.targets[i].key() == key) {
+                self.sel = pos;
+            }
+        }
+    }
+
+    /// Looks again at whether each target is built and up to date. Stats only.
+    pub fn refresh_builds(&mut self) {
+        self.builds.clear();
+        let Some(ws) = &self.ws else { return };
+        for t in &ws.targets {
+            let b = crate::cargo::build_state(&ws.root, &ws.target_dir, t, self.state.release);
+            self.builds.insert(t.key(), b);
+        }
+    }
+
+    fn refresh_selected_build(&mut self) {
+        if let (Some(ws), Some(t)) = (&self.ws, self.selected()) {
+            let b = crate::cargo::build_state(&ws.root, &ws.target_dir, t, self.state.release);
+            self.builds.insert(t.key(), b);
+        }
     }
 
     pub fn refilter(&mut self) {
@@ -170,11 +238,15 @@ impl App {
         })
     }
 
-    pub fn history(&self) -> &[String] {
+    pub fn runs(&self) -> Vec<RunView> {
         match (&self.ws, self.selected()) {
-            (Some(ws), Some(t)) => self.state.history(&ws.root, &t.key()),
-            _ => &[],
+            (Some(ws), Some(t)) => self.state.runs(&ws.root, &t.key()),
+            _ => Vec::new(),
         }
+    }
+
+    pub fn selected_build(&self) -> Option<&BuildState> {
+        self.builds.get(&self.selected()?.key())
     }
 
     fn on_select(&mut self) {
@@ -188,57 +260,79 @@ impl App {
         }
         self.selected_key = Some(key.clone());
         self.flag_sel = 0;
-        self.hist_sel = 0;
+        self.run_sel = 0;
         self.hist_nav = None;
         self.raw_scroll = 0;
         let root = self.ws.as_ref().unwrap().root.clone();
-        let last_args = self
-            .state
-            .history(&root, &key)
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        let last_args = self.runs().first().map(|r| r.args.clone()).unwrap_or_default();
         self.args.set(&last_args);
         self.state.set_last_target(&root, &key);
-        self.scans
-            .entry(key.clone())
-            .or_insert_with(|| crate::source::scan(&t.src_path));
-        if !self.helps.contains_key(&key) {
-            self.request_help(root, t);
-        }
+        self.refresh_selected_build();
+        self.scans.entry(key).or_insert_with(|| {
+            let sources = crate::source::read_sources(&t.src_path);
+            let parser = crate::source::parser_of(&sources, &t.deps);
+            (crate::source::scan_sources(&sources), parser)
+        });
     }
 
-    fn request_help(&mut self, root: PathBuf, target: Target) {
-        let key = target.key();
-        self.helps.insert(key.clone(), HelpState::Loading);
-        let _ = self.tx.send(Request { key, root, target });
+    /// Builds the selected target and reads its `--help` or `-h`.
+    fn request_help(&mut self, mode: Source) {
+        let (Some(ws), Some(t)) = (&self.ws, self.selected().cloned()) else {
+            return;
+        };
+        let key = t.key();
+        let req = Request {
+            key: key.clone(),
+            root: ws.root.clone(),
+            target: t,
+            release: self.state.release,
+            mode,
+        };
+        self.reading.insert(key);
+        let _ = self.tx.send(req);
+        self.status = Some(format!("building and reading {}", mode.label()));
     }
 
     pub fn on_response(&mut self, r: Response) {
-        match r {
-            Response::Done(key, info) => {
-                self.helps.insert(key, HelpState::Ready(info));
-            }
-            Response::Skipped(key) => {
-                self.helps.remove(&key);
-                if self.selected_key.as_deref() == Some(key.as_str()) {
-                    if let (Some(ws), Some(t)) = (&self.ws, self.selected().cloned()) {
-                        self.request_help(ws.root.clone(), t);
-                    }
+        self.state.set_params(&r.root, &r.key, r.info);
+        self.state.save();
+        if self.ws.as_ref().is_some_and(|ws| ws.root == r.root) {
+            self.reading.remove(&r.key);
+            if let Some(ws) = &self.ws {
+                if let Some(t) = ws.targets.iter().find(|t| t.key() == r.key) {
+                    let b = crate::cargo::build_state(&ws.root, &ws.target_dir, t, self.state.release);
+                    self.builds.insert(r.key.clone(), b);
                 }
             }
         }
     }
 
-    /// The best available help for the selected target, and whether a
-    /// `--help` fetch is still running.
-    pub fn current_help(&self) -> Option<(&HelpInfo, bool)> {
+    /// The flags of the selected target: those read from it and kept, here or
+    /// in another worktree, or else those scanned from its source.
+    pub fn current_help(&self) -> Option<(&HelpInfo, Origin)> {
         let key = self.selected_key.as_ref()?;
-        match self.helps.get(key) {
-            Some(HelpState::Ready(h)) => Some((h, false)),
-            Some(HelpState::Loading) => self.scans.get(key).map(|h| (h, true)),
-            None => self.scans.get(key).map(|h| (h, false)),
+        let root = &self.ws.as_ref()?.root;
+        if let Some((rec, other)) = self.state.params(root, key) {
+            return Some((
+                &rec.info,
+                Origin::Kept {
+                    updated: rec.updated,
+                    other,
+                },
+            ));
         }
+        self.scans.get(key).map(|(h, _)| (h, Origin::Scan))
+    }
+
+    /// How the selected target reads its command line, from its source.
+    pub fn parser(&self) -> Option<&'static str> {
+        self.scans.get(self.selected_key.as_ref()?).map(|(_, p)| *p)
+    }
+
+    pub fn is_reading(&self) -> bool {
+        self.selected_key
+            .as_ref()
+            .is_some_and(|k| self.reading.contains(k))
     }
 
     pub fn flag_rows(&self) -> Vec<FlagRow> {
@@ -303,15 +397,13 @@ impl App {
     }
 
     fn insert_arg(&mut self, s: &str) {
+        self.args.end();
         let before = self.args.before_cursor();
         if !before.is_empty() && !before.ends_with(' ') {
             self.args.insert(' ');
         }
         self.args.insert_str(s);
-        if s.ends_with(' ') {
-            return;
-        }
-        if self.args.cursor == self.args.text.chars().count() {
+        if !s.ends_with(' ') {
             self.args.insert(' ');
         }
     }
@@ -354,24 +446,49 @@ impl App {
         true
     }
 
-    fn run_action(&mut self) -> Action {
-        let Some(t) = self.selected().cloned() else {
+    /// Runs the selected target with the arguments shown: by `cargo run`, or
+    /// `direct`ly as it was last built, which builds nothing.
+    fn run_action(&mut self, direct: bool) -> Action {
+        let (Some(ws), Some(t)) = (&self.ws, self.selected().cloned()) else {
             return Action::None;
         };
-        match self.program_args() {
-            Ok(args) => {
-                let root = self.ws.as_ref().unwrap().root.clone();
-                self.state.push_args(&root, &t.key(), self.args.text.trim());
-                self.state.save();
-                self.hist_sel = 0;
-                self.hist_nav = None;
-                Action::Run(t.run_argv(self.state.release, &args))
-            }
+        let args = match self.program_args() {
+            Ok(a) => a,
             Err(e) => {
                 self.status = Some(e);
-                Action::None
+                return Action::None;
             }
-        }
+        };
+        let (argv, env) = if direct {
+            let exe = t.exe_path(&ws.target_dir, self.state.release);
+            if !exe.is_file() {
+                self.status = Some(format!(
+                    "not built in {}; x runs it by cargo run",
+                    if self.state.release { "release" } else { "debug" }
+                ));
+                return Action::None;
+            }
+            let mut argv = vec![exe.display().to_string()];
+            argv.extend(args);
+            let pkg_dir = t.manifest_path.parent().unwrap_or(&ws.root);
+            (
+                argv,
+                vec![("CARGO_MANIFEST_DIR".to_string(), pkg_dir.display().to_string())],
+            )
+        } else {
+            (t.run_argv(self.state.release, &args), Vec::new())
+        };
+        let root = ws.root.clone();
+        self.state.push_run(&root, &t.key(), self.args.text.trim());
+        self.state.save();
+        self.run_sel = 0;
+        self.hist_nav = None;
+        Action::Run { argv, env }
+    }
+
+    /// After a run, which may have built the target.
+    pub fn after_run(&mut self) {
+        self.refresh_selected_build();
     }
 
     pub fn dir_candidates(&self) -> Vec<PathBuf> {
@@ -443,13 +560,24 @@ impl App {
             return Action::Quit;
         }
         self.status = None;
+        // Cmd-enter runs at once, from anywhere; ctrl- and alt-enter too, for
+        // terminals that do not pass Cmd through.
+        let run_mods = KeyModifiers::SUPER | KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let picking = matches!(self.focus, Focus::DirPicker | Focus::Worktrees);
+        if !picking
+            && (key.code == KeyCode::F(5)
+                || key.code == KeyCode::Enter && key.modifiers.intersects(run_mods))
+        {
+            return self.run_action(false);
+        }
         match self.focus {
             Focus::Targets => self.key_targets(key),
             Focus::Filter => self.key_filter(key),
+            Focus::Runs => self.key_runs(key),
             Focus::Flags => self.key_flags(key),
-            Focus::History => self.key_history(key),
             Focus::Args => self.key_args(key),
             Focus::DirPicker => self.key_dir(key),
+            Focus::Worktrees => self.key_worktrees(key),
         }
     }
 
@@ -459,15 +587,57 @@ impl App {
         self.focus = Focus::DirPicker;
     }
 
+    /// Lists the worktrees whose copy of the workspace has the selected target.
+    fn open_worktrees(&mut self) {
+        let (Some(ws), Some(t)) = (&self.ws, self.selected()) else {
+            return;
+        };
+        let key = t.key();
+        let rows: Vec<WorktreeRow> = crate::cargo::worktrees(&ws.root)
+            .into_iter()
+            .filter_map(|w| {
+                let there = ws.target_in(t, &w.root)?;
+                let build = crate::cargo::build_state(
+                    &w.root,
+                    &ws.target_dir_in(&w.root),
+                    &there,
+                    self.state.release,
+                );
+                let runs = self
+                    .state
+                    .runs
+                    .get(&key)
+                    .and_then(|m| m.get(&w.root.display().to_string()))
+                    .map_or(0, Vec::len);
+                Some(WorktreeRow {
+                    current: w.root == ws.root,
+                    worktree: w,
+                    build,
+                    runs,
+                })
+            })
+            .collect();
+        if rows.len() < 2 {
+            self.status = Some(match rows.len() {
+                0 => "this workspace is not in a git repository with worktrees".into(),
+                _ => "no other worktree has this target".into(),
+            });
+            return;
+        }
+        self.wt_sel = rows.iter().position(|r| r.current).unwrap_or(0);
+        self.wt_rows = rows;
+        self.focus = Focus::Worktrees;
+    }
+
     /// Keys shared by the list panes.
     fn key_common(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    Focus::Targets => Focus::Flags,
-                    Focus::Flags => Focus::History,
-                    Focus::History => Focus::Args,
+                    Focus::Targets => Focus::Runs,
+                    Focus::Runs => Focus::Flags,
+                    Focus::Flags => Focus::Args,
                     _ => Focus::Targets,
                 };
                 Some(Action::None)
@@ -475,9 +645,9 @@ impl App {
             KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Focus::Targets => Focus::Args,
-                    Focus::Flags => Focus::Targets,
-                    Focus::History => Focus::Flags,
-                    _ => Focus::History,
+                    Focus::Runs => Focus::Targets,
+                    Focus::Flags => Focus::Runs,
+                    _ => Focus::Flags,
                 };
                 Some(Action::None)
             }
@@ -486,10 +656,12 @@ impl App {
                 self.focus = Focus::Args;
                 Some(Action::None)
             }
-            KeyCode::Char('x') | KeyCode::F(5) => Some(self.run_action()),
+            KeyCode::Char('x') => Some(self.run_action(false)),
+            KeyCode::Char('X') => Some(self.run_action(true)),
             KeyCode::Char('r') => {
                 self.state.release = !self.state.release;
                 self.state.save();
+                self.refresh_builds();
                 Some(Action::None)
             }
             KeyCode::Char('v') => {
@@ -498,18 +670,26 @@ impl App {
                 Some(Action::None)
             }
             KeyCode::Char('h') => {
-                if let (Some(ws), Some(t)) = (&self.ws, self.selected().cloned()) {
-                    let root = ws.root.clone();
-                    self.scans.insert(t.key(), crate::source::scan(&t.src_path));
-                    self.request_help(root, t);
-                    self.status = Some("rebuilding and re-reading --help".into());
-                }
+                self.request_help(Source::Help);
+                Some(Action::None)
+            }
+            KeyCode::Char('u') => {
+                self.request_help(Source::Usage);
+                Some(Action::None)
+            }
+            KeyCode::Char('w') => {
+                self.open_worktrees();
                 Some(Action::None)
             }
             KeyCode::Char('R') => {
                 let dir = self.dir.clone();
+                let key = self.selected_key.clone();
                 self.load_dir(&dir);
-                self.status = Some("reloaded targets".into());
+                if let Some(k) = key {
+                    self.select_key(&k);
+                    self.on_select();
+                }
+                self.status = Some("reloaded targets and build states".into());
                 Some(Action::None)
             }
             KeyCode::Char('d') | KeyCode::Char('o') => {
@@ -517,6 +697,15 @@ impl App {
                 Some(Action::None)
             }
             _ => None,
+        }
+    }
+
+    /// The pane to the right of the targets: their runs, if any, else flags.
+    fn right_of_targets(&self) -> Focus {
+        if self.runs().is_empty() {
+            Focus::Flags
+        } else {
+            Focus::Runs
         }
     }
 
@@ -529,7 +718,13 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.move_sel(-(self.visible.len() as isize)),
             KeyCode::End | KeyCode::Char('G') => self.move_sel(self.visible.len() as isize),
             KeyCode::Char('/') => self.focus = Focus::Filter,
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.selected().is_some() {
+                    self.focus = self.right_of_targets();
+                    self.run_sel = 0;
+                }
+            }
+            KeyCode::Enter => {
                 if self.selected().is_some() {
                     self.args.end();
                     self.focus = Focus::Args;
@@ -555,7 +750,7 @@ impl App {
                 self.filter.clear();
                 self.focus = Focus::Targets;
             }
-            KeyCode::Enter | KeyCode::Tab => self.focus = Focus::Targets,
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Right => self.focus = Focus::Targets,
             KeyCode::Up => return self.key_targets(key),
             KeyCode::Down => return self.key_targets(key),
             KeyCode::Backspace => self.filter.backspace(),
@@ -564,6 +759,48 @@ impl App {
         }
         self.refilter();
         self.on_select();
+        Action::None
+    }
+
+    /// Up and down choose a past run, and its arguments are put in the args line.
+    fn key_runs(&mut self, key: KeyEvent) -> Action {
+        let runs = self.runs();
+        let n = runs.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.run_sel = self.run_sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.run_sel = (self.run_sel + 1).min(n.saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                self.args.end();
+                self.focus = Focus::Args;
+                return Action::None;
+            }
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('D') => {
+                if let (Some(ws), Some(t), Some(r)) = (&self.ws, self.selected(), runs.get(self.run_sel)) {
+                    let (root, k) = (ws.root.clone(), t.key());
+                    self.state.remove_run(&root, &k, r);
+                    self.state.save();
+                    let n = self.runs().len();
+                    self.run_sel = self.run_sel.min(n.saturating_sub(1));
+                    if n == 0 {
+                        self.focus = Focus::Targets;
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Left => {
+                self.focus = Focus::Targets;
+                return Action::None;
+            }
+            KeyCode::Right => {
+                self.focus = Focus::Flags;
+                return Action::None;
+            }
+            _ => return self.key_common(key).unwrap_or(Action::None),
+        }
+        if let Some(r) = self.runs().get(self.run_sel) {
+            self.args.set(&r.args);
+        }
         Action::None
     }
 
@@ -582,74 +819,59 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.flag_sel = (self.flag_sel + 1).min(n.saturating_sub(1))
             }
-            KeyCode::Enter | KeyCode::Char(' ') if !self.raw => {
+            KeyCode::PageUp => self.flag_sel = self.flag_sel.saturating_sub(10),
+            KeyCode::PageDown => self.flag_sel = (self.flag_sel + 10).min(n.saturating_sub(1)),
+            // Right and space add the flag and stay; enter adds it and edits.
+            KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter if !self.raw => {
                 let rows = self.flag_rows();
-                if let Some(row) = rows.get(self.flag_sel) {
-                    if let Some(ins) = &row.insert {
-                        self.insert_arg(ins);
-                    }
+                if let Some(ins) = rows.get(self.flag_sel).and_then(|r| r.insert.clone()) {
+                    self.insert_arg(&ins);
+                }
+                if key.code == KeyCode::Enter {
                     self.focus = Focus::Args;
                 }
             }
-            KeyCode::Esc | KeyCode::Left => self.focus = Focus::Targets,
+            KeyCode::Esc => self.focus = Focus::Targets,
+            KeyCode::Left => self.focus = self.right_of_targets_back(),
             _ => return self.key_common(key).unwrap_or(Action::None),
         }
         Action::None
     }
 
-    fn key_history(&mut self, key: KeyEvent) -> Action {
-        let n = self.history().len();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.hist_sel = self.hist_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.hist_sel = (self.hist_sel + 1).min(n.saturating_sub(1))
-            }
-            KeyCode::Enter => {
-                if let Some(a) = self.history().get(self.hist_sel).cloned() {
-                    self.args.set(&a);
-                    self.focus = Focus::Args;
-                }
-            }
-            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('D') => {
-                if let (Some(ws), Some(t)) = (&self.ws, self.selected()) {
-                    let (root, k) = (ws.root.clone(), t.key());
-                    self.state.remove_args(&root, &k, self.hist_sel);
-                    self.state.save();
-                    self.hist_sel = self.hist_sel.min(self.history().len().saturating_sub(1));
-                }
-            }
-            KeyCode::Esc | KeyCode::Left => self.focus = Focus::Targets,
-            _ => return self.key_common(key).unwrap_or(Action::None),
+    /// Left of the flags: the runs, if any, else the targets.
+    fn right_of_targets_back(&self) -> Focus {
+        match self.right_of_targets() {
+            Focus::Runs => Focus::Runs,
+            _ => Focus::Targets,
         }
-        Action::None
     }
 
     fn key_args(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Enter => return self.run_action(),
+            KeyCode::Enter => return self.run_action(false),
             KeyCode::Esc => self.focus = Focus::Targets,
             KeyCode::Tab => {
                 if !self.complete_arg() {
                     self.focus = Focus::Targets;
                 }
             }
-            KeyCode::BackTab => self.focus = Focus::History,
+            KeyCode::BackTab => self.focus = Focus::Flags,
             KeyCode::Up | KeyCode::Down => {
-                let hist = self.history().to_vec();
-                if hist.is_empty() {
+                let runs = self.runs();
+                if runs.is_empty() {
                     return Action::None;
                 }
                 let next = match (key.code, self.hist_nav) {
                     (KeyCode::Up, None) => Some(0),
-                    (KeyCode::Up, Some(i)) => Some((i + 1).min(hist.len() - 1)),
+                    (KeyCode::Up, Some(i)) => Some((i + 1).min(runs.len() - 1)),
                     (KeyCode::Down, Some(0)) | (KeyCode::Down, None) => None,
                     (KeyCode::Down, Some(i)) => Some(i - 1),
                     _ => None,
                 };
                 self.hist_nav = next;
                 match next {
-                    Some(i) => self.args.set(&hist[i]),
+                    Some(i) => self.args.set(&runs[i].args),
                     None => self.args.clear(),
                 }
             }
@@ -706,13 +928,32 @@ impl App {
         Action::None
     }
 
-    pub fn source_label(&self) -> &'static str {
-        match self.current_help() {
-            Some((_, true)) => "reading --help…",
-            Some((h, false)) if h.source == Source::Help => "from --help",
-            Some(_) => "from source scan",
-            None => "",
+    fn key_worktrees(&mut self, key: KeyEvent) -> Action {
+        let n = self.wt_rows.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('w') | KeyCode::Char('q') => {
+                self.focus = Focus::Targets
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.wt_sel = self.wt_sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.wt_sel = (self.wt_sel + 1).min(n.saturating_sub(1))
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                let Some(row) = self.wt_rows.get(self.wt_sel) else {
+                    return Action::None;
+                };
+                let root = row.worktree.root.clone();
+                let key = self.selected_key.clone();
+                self.focus = Focus::Targets;
+                self.load_dir(&root);
+                if let Some(k) = key {
+                    self.select_key(&k);
+                    self.on_select();
+                }
+            }
+            _ => {}
         }
+        Action::None
     }
 }
 

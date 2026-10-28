@@ -30,6 +30,10 @@ pub struct Target {
     pub kind: Kind,
     pub src_path: PathBuf,
     pub required_features: Vec<String>,
+    /// The `Cargo.toml` of the package.
+    pub manifest_path: PathBuf,
+    /// Names of the package's dependencies, of every kind.
+    pub deps: Vec<String>,
 }
 
 impl Target {
@@ -70,12 +74,208 @@ impl Target {
         }
         argv
     }
+
+    /// Where cargo puts the executable of this target, built or not.
+    pub fn exe_path(&self, target_dir: &Path, release: bool) -> PathBuf {
+        let mut p = target_dir.join(if release { "release" } else { "debug" });
+        if self.kind == Kind::Example {
+            p.push("examples");
+        }
+        p.push(&self.name);
+        p
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub root: PathBuf,
+    pub target_dir: PathBuf,
     pub targets: Vec<Target>,
+}
+
+/// Whether a target's executable is there and newer than what it was built from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BuildState {
+    Unbuilt,
+    Fresh,
+    /// Built, but these files changed after (the first few of them).
+    Stale(Vec<PathBuf>),
+}
+
+impl BuildState {
+    pub fn circle(&self) -> &'static str {
+        match self {
+            BuildState::Unbuilt => "○",
+            BuildState::Fresh => "●",
+            BuildState::Stale(_) => "◐",
+        }
+    }
+}
+
+/// Compares the executable's time with those of the files that cargo's
+/// dep-info lists for it, the package's manifest and the workspace's lock
+/// file. Cheap, stats only; it cannot see a change of features or flags.
+pub fn build_state(ws_root: &Path, target_dir: &Path, t: &Target, release: bool) -> BuildState {
+    let exe = t.exe_path(target_dir, release);
+    let Ok(built) = std::fs::metadata(&exe).and_then(|m| m.modified()) else {
+        return BuildState::Unbuilt;
+    };
+    let mut sources = vec![t.manifest_path.clone(), ws_root.join("Cargo.lock")];
+    let dep_info = exe.with_file_name(format!("{}.d", t.name));
+    match std::fs::read_to_string(&dep_info) {
+        Ok(text) => sources.extend(parse_dep_info(&text)),
+        Err(_) => sources.push(t.src_path.clone()),
+    }
+    let newer: Vec<PathBuf> = sources
+        .into_iter()
+        .filter(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m > built)
+        })
+        .take(5)
+        .collect();
+    if newer.is_empty() {
+        BuildState::Fresh
+    } else {
+        BuildState::Stale(newer)
+    }
+}
+
+/// The prerequisites of a make-style dep-info file (`out: a b\ c ...`).
+fn parse_dep_info(text: &str) -> Vec<PathBuf> {
+    let Some(line) = text.lines().next() else {
+        return Vec::new();
+    };
+    // The output is an absolute path; its colon is the first one followed by a space.
+    let Some(pos) = line.find(": ") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line[pos + 2..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            ' ' => {
+                if !cur.is_empty() {
+                    out.push(PathBuf::from(std::mem::take(&mut cur)));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(PathBuf::from(cur));
+    }
+    out
+}
+
+/// A git worktree of the repository a workspace is in.
+#[derive(Clone, Debug)]
+pub struct Worktree {
+    /// The workspace root inside this worktree.
+    pub root: PathBuf,
+    pub branch: Option<String>,
+    pub head: String,
+}
+
+impl Worktree {
+    pub fn label(&self) -> String {
+        match &self.branch {
+            Some(b) => b.clone(),
+            None => format!("detached {}", &self.head[..self.head.len().min(7)]),
+        }
+    }
+}
+
+/// The worktrees of the repository that holds `ws_root`, each with the path
+/// at which the same workspace sits in it. Empty if it is not in git.
+pub fn worktrees(ws_root: &Path) -> Vec<Worktree> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(ws_root)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        return Vec::new();
+    };
+    let top = PathBuf::from(top.trim());
+    let top = top.canonicalize().unwrap_or(top);
+    let rel = ws_root
+        .strip_prefix(&top)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let Some(list) = git(&["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    parse_worktrees(&list, &rel)
+}
+
+fn parse_worktrees(porcelain: &str, rel: &Path) -> Vec<Worktree> {
+    let mut out = Vec::new();
+    for block in porcelain.split("\n\n") {
+        let mut path = None;
+        let mut head = String::new();
+        let mut branch = None;
+        let mut bare = false;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(h) = line.strip_prefix("HEAD ") {
+                head = h.to_string();
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(b.trim_start_matches("refs/heads/").to_string());
+            } else if line == "bare" {
+                bare = true;
+            }
+        }
+        if let (Some(p), false) = (path, bare) {
+            let root = p.join(rel);
+            out.push(Worktree {
+                root: root.canonicalize().unwrap_or(root),
+                branch,
+                head,
+            });
+        }
+    }
+    out
+}
+
+impl Workspace {
+    /// The same target as it would be in another worktree's copy of this
+    /// workspace, if its source file is there.
+    pub fn target_in(&self, t: &Target, other_root: &Path) -> Option<Target> {
+        let moved = |p: &Path| p.strip_prefix(&self.root).ok().map(|r| other_root.join(r));
+        let src = moved(&t.src_path)?;
+        if !src.is_file() {
+            return None;
+        }
+        Some(Target {
+            src_path: src,
+            manifest_path: moved(&t.manifest_path)?,
+            ..t.clone()
+        })
+    }
+
+    /// The target directory another worktree's copy of this workspace would
+    /// use: moved with it if it is inside the workspace, else shared.
+    pub fn target_dir_in(&self, other_root: &Path) -> PathBuf {
+        match self.target_dir.strip_prefix(&self.root) {
+            Ok(rel) => other_root.join(rel),
+            Err(_) => self.target_dir.clone(),
+        }
+    }
 }
 
 /// Runs `cargo metadata` in `dir` and collects every bin and example target
@@ -101,9 +301,20 @@ pub fn discover(dir: &Path) -> Result<Workspace> {
 fn parse_metadata(json: &[u8]) -> Result<Workspace> {
     let v: Value = serde_json::from_slice(json).context("bad cargo metadata json")?;
     let root = PathBuf::from(v["workspace_root"].as_str().unwrap_or("."));
+    let target_dir = v["target_directory"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
     let mut targets = Vec::new();
     for pkg in v["packages"].as_array().into_iter().flatten() {
         let package = pkg["name"].as_str().unwrap_or_default().to_string();
+        let manifest_path = PathBuf::from(pkg["manifest_path"].as_str().unwrap_or_default());
+        let deps: Vec<String> = pkg["dependencies"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
         for t in pkg["targets"].as_array().into_iter().flatten() {
             let kinds: Vec<&str> = t["kind"]
                 .as_array()
@@ -133,18 +344,25 @@ fn parse_metadata(json: &[u8]) -> Result<Workspace> {
                     .flatten()
                     .filter_map(|f| f.as_str().map(String::from))
                     .collect(),
+                manifest_path: manifest_path.clone(),
+                deps: deps.clone(),
             });
         }
     }
     targets.sort_by(|a, b| (a.kind, &a.package, &a.name).cmp(&(b.kind, &b.package, &b.name)));
-    Ok(Workspace { root, targets })
+    Ok(Workspace {
+        root,
+        target_dir,
+        targets,
+    })
 }
 
-/// Builds the target (debug profile) and returns the path of the executable.
-pub fn build(root: &Path, target: &Target) -> Result<PathBuf> {
+/// Builds the target and returns the path of the executable.
+pub fn build(root: &Path, target: &Target, release: bool) -> Result<PathBuf> {
     let out = Command::new("cargo")
         .arg("build")
         .args(target.selector_args())
+        .args(release.then_some("--release"))
         .args(["--message-format", "json-render-diagnostics"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -176,7 +394,6 @@ pub fn build(root: &Path, target: &Target) -> Result<PathBuf> {
 /// Output of running a program with a timeout.
 pub struct Captured {
     pub output: String,
-    pub success: bool,
     pub timed_out: bool,
 }
 
@@ -209,14 +426,14 @@ pub fn run_captured(exe: &Path, args: &[&str], cwd: &Path, timeout: Duration) ->
     });
 
     let start = Instant::now();
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (Some(status), false);
+    let timed_out = loop {
+        if child.try_wait()?.is_some() {
+            break false;
         }
         if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            break (None, true);
+            break true;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -230,7 +447,6 @@ pub fn run_captured(exe: &Path, args: &[&str], cwd: &Path, timeout: Duration) ->
     }
     Ok(Captured {
         output: strip_ansi(&output),
-        success: status.is_some_and(|s| s.success()),
         timed_out,
     })
 }
@@ -298,5 +514,63 @@ mod tests {
                 "-v"
             ]
         );
+        assert_eq!(ws.target_dir, PathBuf::from("/ws/target"));
+        assert_eq!(
+            ws.targets[1].exe_path(&ws.target_dir, true),
+            PathBuf::from("/ws/target/release/examples/hello")
+        );
+        assert_eq!(
+            ws.targets[0].exe_path(&ws.target_dir, false),
+            PathBuf::from("/ws/target/debug/demo")
+        );
+    }
+
+    #[test]
+    fn parses_dep_info() {
+        let d = "/t/debug/x: /a/src/main.rs /b/with\\ space.rs\n\n/a/src/main.rs:\n";
+        assert_eq!(
+            parse_dep_info(d),
+            [PathBuf::from("/a/src/main.rs"), PathBuf::from("/b/with space.rs")]
+        );
+    }
+
+    #[test]
+    fn build_state_follows_times() {
+        let dir = std::env::temp_dir().join(format!("cargo-explore-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        let src = dir.join("main.rs");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&src, "fn main() {}").unwrap();
+        std::fs::write(&manifest, "").unwrap();
+        let t = Target {
+            package: "p".into(),
+            name: "x".into(),
+            kind: Kind::Bin,
+            src_path: src.clone(),
+            required_features: Vec::new(),
+            manifest_path: manifest,
+            deps: Vec::new(),
+        };
+        let td = dir.join("target");
+        assert_eq!(build_state(&dir, &td, &t, false), BuildState::Unbuilt);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(td.join("debug/x"), "").unwrap();
+        std::fs::write(td.join("debug/x.d"), format!("{}: {}\n", td.join("debug/x").display(), src.display())).unwrap();
+        assert_eq!(build_state(&dir, &td, &t, false), BuildState::Fresh);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&src, "fn main() { }").unwrap();
+        assert_eq!(build_state(&dir, &td, &t, false), BuildState::Stale(vec![src]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_worktree_list() {
+        let p = "worktree /r\nHEAD 1111111111\nbranch refs/heads/main\n\nworktree /w/x\nHEAD 2222222222abc\ndetached\n\nworktree /bare\nbare\n";
+        let w = parse_worktrees(p, Path::new("sub"));
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].root, PathBuf::from("/r/sub"));
+        assert_eq!(w[0].label(), "main");
+        assert_eq!(w[1].label(), "detached 2222222");
     }
 }

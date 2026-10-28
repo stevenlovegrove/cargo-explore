@@ -1,11 +1,14 @@
 //! Rendering.
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, Origin};
+use crate::cargo::BuildState;
+use crate::state::ago;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use std::path::Path;
 
 const ACCENT: Color = Color::Cyan;
 
@@ -28,6 +31,22 @@ fn highlight(focused: bool) -> Style {
     } else {
         Style::new().add_modifier(Modifier::REVERSED)
     }
+}
+
+fn circle(b: Option<&BuildState>) -> Span<'static> {
+    match b {
+        Some(b @ BuildState::Fresh) => b.circle().green(),
+        Some(b @ BuildState::Stale(_)) => b.circle().yellow(),
+        Some(b) => b.circle().dark_gray(),
+        None => " ".into(),
+    }
+}
+
+/// The last part of a path, to name a worktree shortly.
+fn short(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -55,8 +74,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     draw_footer(f, app, footer);
 
-    if app.focus == Focus::DirPicker {
-        draw_dir_picker(f, app);
+    match app.focus {
+        Focus::DirPicker => draw_dir_picker(f, app),
+        Focus::Worktrees => draw_worktrees(f, app),
+        _ => {}
     }
 }
 
@@ -73,6 +94,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ws) = &app.ws {
         if ws.root != app.dir {
             spans.push(format!("  (workspace {})", ws.root.display()).dark_gray());
+        }
+    }
+    if let Some(w) = &app.worktree {
+        spans.push(format!("  ⎇ {}", w.label()).magenta());
+        if app.worktree_count > 1 {
+            spans.push(format!(" ({} worktrees)", app.worktree_count).dark_gray());
         }
     }
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(9)]).areas(area);
@@ -120,7 +147,12 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
                 crate::cargo::Kind::Bin => "bin ".green(),
                 crate::cargo::Kind::Example => "ex  ".magenta(),
             };
-            let mut spans = vec![kind, Span::raw(format!("{:<name_w$}", t.name))];
+            let mut spans = vec![
+                circle(app.builds.get(&t.key())),
+                " ".into(),
+                kind,
+                Span::raw(format!("{:<name_w$}", t.name)),
+            ];
             if multi {
                 spans.push(format!("  {}", t.package).dark_gray());
             }
@@ -141,13 +173,39 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn build_line(app: &App) -> Line<'static> {
+    let profile = if app.state.release { "release" } else { "debug" };
+    let b = app.selected_build();
+    let mut spans = vec![circle(b), " ".into()];
+    match b {
+        Some(BuildState::Fresh) => spans.push(format!("built, up to date ({profile})").green()),
+        Some(BuildState::Stale(newer)) => {
+            let root = app.ws.as_ref().map(|w| w.root.as_path());
+            let names: Vec<String> = newer
+                .iter()
+                .map(|p| {
+                    root.and_then(|r| p.strip_prefix(r).ok())
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            spans.push(format!("built ({profile}), changed since: ").yellow());
+            spans.push(names.join(", ").dark_gray());
+            spans.push("  · x cargo run · X run as built".dark_gray());
+        }
+        _ => spans.push(format!("not built ({profile})").dark_gray()),
+    }
+    Line::from(spans)
+}
+
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let Some(t) = app.selected() else {
         f.render_widget(pane(" Details ".into(), false), area);
         return;
     };
     let help = app.current_help();
-    let history = app.history();
+    let runs = app.runs();
 
     // Info block.
     let mut info: Vec<Line> = Vec::new();
@@ -163,8 +221,14 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let src = root
         .and_then(|r| t.src_path.strip_prefix(r).ok())
         .unwrap_or(&t.src_path);
-    info.push(Line::from(src.display().to_string().dark_gray()));
-    if let Some((h, _)) = help {
+    let mut src_line = vec![src.display().to_string().dark_gray()];
+    if let Some(p) = app.parser() {
+        src_line.push("  · parser: ".dark_gray());
+        src_line.push(p.to_string().into());
+    }
+    info.push(Line::from(src_line));
+    info.push(build_line(app));
+    if let Some((h, _)) = &help {
         if !h.about.is_empty() {
             info.push(Line::from(h.about.clone()));
         }
@@ -178,12 +242,12 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             info.push(Line::from(n.clone().yellow()));
         }
     }
-    let info_h = (info.len() as u16 + 1).min(area.height / 3).max(3);
-    let hist_h = (history.len() as u16 + 2).clamp(3, 10);
-    let [info_area, flags_area, hist_area] = Layout::vertical([
+    let info_h = (info.len() as u16 + 1).min(area.height / 3).max(4);
+    let runs_h = (runs.len() as u16 + 2).clamp(3, 10);
+    let [info_area, runs_area, flags_area] = Layout::vertical([
         Constraint::Length(info_h),
+        Constraint::Length(runs_h),
         Constraint::Min(4),
-        Constraint::Length(hist_h),
     ])
     .areas(area);
     f.render_widget(
@@ -193,19 +257,36 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         info_area,
     );
 
-    // Flags pane (or raw help text).
+    draw_runs(f, app, &runs, runs_area);
+
+    // Flags pane (or raw help text), with where its flags are from in the corner.
     let focused = app.focus == Focus::Flags;
-    let label = app.source_label();
+    let corner: Line = if app.is_reading() {
+        Line::from(" building and reading… ".yellow())
+    } else {
+        match &help {
+            Some((h, Origin::Kept { updated, other: None })) => Line::from(vec![
+                format!(" {} · ", h.source.label()).dark_gray(),
+                format!("updated {} ", ago(*updated)).gray(),
+            ]),
+            Some((h, Origin::Kept { updated, other: Some(o) })) => Line::from(vec![
+                format!(" {} · ", h.source.label()).dark_gray(),
+                format!("from {} {} · h to refresh ", short(o), ago(*updated)).yellow(),
+            ]),
+            _ => Line::from(" source scan · h --help · u -h ".dark_gray()),
+        }
+    };
+    let corner = corner.right_aligned();
     if app.raw {
-        let raw = help.map(|(h, _)| h.raw.clone()).unwrap_or_default();
+        let raw = help.as_ref().map(|(h, _)| h.raw.clone()).unwrap_or_default();
         let raw = if raw.trim().is_empty() {
-            "(no output captured)".to_string()
+            "(no output captured; h reads --help, u reads -h)".to_string()
         } else {
             raw
         };
         let p = Paragraph::new(raw)
             .scroll((app.raw_scroll, 0))
-            .block(pane(format!(" Raw help output · {label} "), focused));
+            .block(pane(" Raw help output ".into(), focused).title_top(corner));
         f.render_widget(p, flags_area);
     } else {
         let rows = app.flag_rows();
@@ -235,13 +316,13 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
                 ]))
             })
             .collect();
-        let title = format!(" Flags & arguments ({}) · {label} ", rows.len());
-        let block = pane(title, focused);
+        let title = format!(" Flags & arguments ({}) ", rows.len());
+        let block = pane(title, focused).title_top(corner);
         if items.is_empty() {
-            let msg = if help.is_some_and(|(_, loading)| loading) {
-                "building and reading --help…"
+            let msg = if app.is_reading() {
+                "building and reading…"
             } else {
-                "no flags found (press v to see raw output)"
+                "no flags found · h reads --help, u reads -h (builds the target)"
             };
             f.render_widget(Paragraph::new(msg.dark_gray()).block(block), flags_area);
         } else {
@@ -252,24 +333,39 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             f.render_stateful_widget(list, flags_area, &mut state);
         }
     }
+}
 
-    // History pane.
-    let focused = app.focus == Focus::History;
-    let items: Vec<ListItem> = history
+fn draw_runs(f: &mut Frame, app: &App, runs: &[crate::state::RunView], area: Rect) {
+    let focused = app.focus == Focus::Runs;
+    let items: Vec<ListItem> = runs
         .iter()
-        .map(|a| {
-            ListItem::new(if a.is_empty() {
-                "(no args)".dark_gray().into()
+        .map(|r| {
+            let mut spans = vec![if r.args.is_empty() {
+                "(no args)".dark_gray()
             } else {
-                Line::from(a.clone())
-            })
+                Span::raw(r.args.clone())
+            }];
+            spans.push(format!("  {}", ago(r.when)).dark_gray());
+            if let Some(o) = &r.other {
+                spans.push(format!("  in {}", short(o)).yellow());
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
+    let block = pane(format!(" Recent runs ({}) ", runs.len()), focused);
+    if items.is_empty() {
+        f.render_widget(
+            Paragraph::new("none yet · cmd-enter or x runs with the args below".dark_gray())
+                .block(block),
+            area,
+        );
+        return;
+    }
     let list = List::new(items)
-        .block(pane(format!(" History ({}) ", history.len()), focused))
+        .block(block)
         .highlight_style(highlight(focused));
-    let mut state = ListState::default().with_selected(focused.then_some(app.hist_sel));
-    f.render_stateful_widget(list, hist_area, &mut state);
+    let mut state = ListState::default().with_selected(focused.then_some(app.run_sel));
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_args(f: &mut Frame, app: &App, area: Rect) {
@@ -277,7 +373,7 @@ fn draw_args(f: &mut Frame, app: &App, area: Rect) {
     let block = pane(" Args ".into(), focused);
     let inner = block.inner(area);
     let text = if app.args.text.is_empty() && !focused {
-        Line::from("press i to edit arguments, x to run".dark_gray())
+        Line::from("enter to edit · cmd-enter runs now".dark_gray())
     } else {
         Line::from(app.args.text.clone())
     };
@@ -297,35 +393,37 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let hints: &[(&str, &str)] = match app.focus {
             Focus::Targets => &[
                 ("↑↓", "select"),
-                ("/", "filter"),
+                ("→", "runs, flags"),
+                ("⌘⏎/x", "run"),
+                ("X", "run as built"),
                 ("enter", "edit args"),
-                ("x", "run"),
-                ("tab", "panes"),
-                ("d", "dir"),
+                ("h/u", "read --help/-h"),
+                ("w", "worktree"),
+                ("/", "filter"),
                 ("r", "release"),
-                ("v", "raw help"),
-                ("h", "re-read help"),
+                ("d", "dir"),
                 ("q", "quit"),
             ],
             Focus::Filter => &[("type", "filter"), ("enter", "done"), ("esc", "clear")],
+            Focus::Runs => &[
+                ("↑↓", "choose args"),
+                ("←→", "panes"),
+                ("⌘⏎/x", "run"),
+                ("enter", "edit"),
+                ("del", "forget"),
+            ],
             Focus::Flags => &[
                 ("↑↓", "select"),
-                ("enter", "insert into args"),
+                ("→/space", "add to args"),
+                ("enter", "add and edit"),
+                ("←", "back"),
+                ("⌘⏎/x", "run"),
                 ("v", "raw help"),
-                ("tab", "next pane"),
-                ("esc", "back"),
-            ],
-            Focus::History => &[
-                ("↑↓", "select"),
-                ("enter", "use"),
-                ("del", "forget"),
-                ("x", "run"),
-                ("esc", "back"),
             ],
             Focus::Args => &[
                 ("enter", "run"),
                 ("tab", "complete flag"),
-                ("↑↓", "history"),
+                ("↑↓", "recent runs"),
                 ("esc", "back"),
             ],
             Focus::DirPicker => &[
@@ -335,6 +433,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ("enter", "open"),
                 ("esc", "cancel"),
             ],
+            Focus::Worktrees => &[("↑↓", "select"), ("enter/→", "switch"), ("esc/←", "cancel")],
         };
         let mut spans = vec![Span::raw(" ")];
         for (k, d) in hints {
@@ -346,16 +445,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_dir_picker(f: &mut Frame, app: &App) {
+fn popup_area(f: &Frame) -> Rect {
     let area = f.area();
     let w = (area.width * 7 / 10).max(40).min(area.width);
     let h = (area.height * 6 / 10).max(8).min(area.height);
-    let popup = Rect::new(
+    Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
         w,
         h,
-    );
+    )
+}
+
+fn draw_dir_picker(f: &mut Frame, app: &App) {
+    let popup = popup_area(f);
     f.render_widget(Clear, popup);
     let block = pane(" Switch directory ".into(), true);
     let inner = block.inner(popup);
@@ -391,4 +494,219 @@ fn draw_dir_picker(f: &mut Frame, app: &App) {
         input.x + 2 + app.dir_input.before_cursor().chars().count() as u16,
         input.y,
     ));
+}
+
+fn draw_worktrees(f: &mut Frame, app: &App) {
+    let popup = popup_area(f);
+    f.render_widget(Clear, popup);
+    let name = app.selected().map(|t| t.name.clone()).unwrap_or_default();
+    let block = pane(format!(" Worktrees that have {name} "), true);
+    let label_w = app
+        .wt_rows
+        .iter()
+        .map(|r| r.worktree.label().chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(40);
+    let items: Vec<ListItem> = app
+        .wt_rows
+        .iter()
+        .map(|r| {
+            let mut spans = vec![
+                circle(Some(&r.build)),
+                " ".into(),
+                format!("{:<label_w$}", r.worktree.label()).magenta(),
+                format!("  {}", r.worktree.root.display()).into(),
+            ];
+            if r.runs > 0 {
+                spans.push(format!("  {} runs", r.runs).dark_gray());
+            }
+            if r.current {
+                spans.push("  (here)".fg(ACCENT));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight(true))
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default().with_selected(Some(app.wt_sel));
+    f.render_stateful_widget(list, popup, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Drives the app by keys on a small workspace in a git repository with
+    //! two worktrees, and reads the screen it draws.
+
+    use super::*;
+    use crate::app::{Action, Response};
+    use crate::help::{Flag, HelpInfo, Source};
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let ok = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "{args:?} failed");
+    }
+
+    /// A package `demo` with a clap bin and a hand-parsed example, committed,
+    /// and a second worktree of it beside.
+    fn fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("cargo-explore-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("examples")).unwrap();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nclap = { version = \"4\", features = [\"derive\"] }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("src/main.rs"),
+            "use clap::Parser;\n/// Does demo things\n#[derive(Parser)]\nstruct Cli {\n    /// Go fast\n    #[arg(long)]\n    fast: bool,\n}\nfn main() { Cli::parse(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("examples/hello.rs"),
+            "fn main() { if std::env::args().any(|a| a == \"--loud\") {} }\n",
+        )
+        .unwrap();
+        let git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"];
+        sh(&ws, &["git", "init", "-q", "-b", "main"]);
+        sh(&ws, &["git", "add", "-A"]);
+        sh(&ws, &[git[0], git[1], git[2], git[3], git[4], "commit", "-qm", "x"]);
+        sh(&ws, &["git", "worktree", "add", "-q", "-b", "other", "../wt2"]);
+        let ws = ws.canonicalize().unwrap();
+        let wt2 = base.join("wt2").canonicalize().unwrap();
+        (base, ws, wt2)
+    }
+
+    fn screen(app: &App) -> String {
+        let mut t = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer();
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    fn key(app: &mut App, code: KeyCode) -> Action {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn argv(a: Action) -> Vec<String> {
+        match a {
+            Action::Run { argv, .. } => argv,
+            _ => panic!("expected a run"),
+        }
+    }
+
+    #[test]
+    fn explores_by_arrows_and_runs_at_once() {
+        let (base, ws, wt2) = fixture("keys");
+        let state = crate::state::State::load(Some(base.join("state.json")));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws.clone(), state, tx);
+
+        // Nothing is built or run to show a target: its flags are from its source.
+        let s = screen(&app);
+        assert!(s.contains("○ bin demo"), "{s}");
+        assert!(s.contains("parser: clap, derive"), "{s}");
+        assert!(s.contains("--fast"), "{s}");
+        assert!(s.contains("source scan"), "{s}");
+        assert!(s.contains("⎇ main"), "{s}");
+        assert!(rx.try_recv().is_err());
+
+        // Down to the example; right to its flags (no runs yet); right adds one.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected().unwrap().name, "hello");
+        assert!(screen(&app).contains("std::env::args, by hand"));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.focus, crate::app::Focus::Flags);
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.args.text, "--loud ");
+
+        // Cmd-enter runs at once from where we are; alt-enter too.
+        let cmd_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER);
+        let a = argv(app.handle_key(cmd_enter));
+        assert_eq!(a[..6], ["cargo", "run", "-p", "demo", "--example", "hello"]);
+        assert_eq!(a.last().unwrap(), "--loud");
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert!(matches!(app.handle_key(alt_enter), Action::Run { .. }));
+
+        // The run is recorded; left goes back to it, and up/down choose args.
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.focus, crate::app::Focus::Runs);
+        assert!(screen(&app).contains("Recent runs (1)"));
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.focus, crate::app::Focus::Targets);
+
+        // X runs as built, which it is not.
+        assert!(matches!(key(&mut app, KeyCode::Char('X')), Action::None));
+        assert!(app.status.as_deref().unwrap().contains("not built"));
+
+        // h asks the worker for --help; what comes back is kept, with its date.
+        key(&mut app, KeyCode::Char('h'));
+        let req = rx.try_recv().unwrap();
+        assert_eq!(req.mode, Source::Help);
+        assert!(screen(&app).contains("building and reading"));
+        app.on_response(Response {
+            key: req.key.clone(),
+            root: req.root.clone(),
+            info: HelpInfo {
+                flags: vec![Flag {
+                    long: Some("--shout".into()),
+                    desc: "from --help".into(),
+                    ..Default::default()
+                }],
+                usage: "hello [--shout]".into(),
+                ..Default::default()
+            },
+        });
+        let s = screen(&app);
+        assert!(s.contains("--shout"), "{s}");
+        assert!(s.contains("updated just now"), "{s}");
+
+        // w lists both worktrees; switching keeps the target, and what was
+        // kept in the first stands in, marked as from there.
+        key(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.focus, crate::app::Focus::Worktrees);
+        assert_eq!(app.wt_rows.len(), 2);
+        let s = screen(&app);
+        assert!(s.contains("Worktrees that have hello"), "{s}");
+        assert!(s.contains("other"), "{s}");
+        let other = app.wt_rows.iter().position(|r| !r.current).unwrap();
+        while app.wt_sel != other {
+            let k = if app.wt_sel < other { KeyCode::Down } else { KeyCode::Up };
+            key(&mut app, k);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ws.as_ref().unwrap().root, wt2);
+        assert_eq!(app.selected().unwrap().name, "hello");
+        let s = screen(&app);
+        assert!(s.contains("⎇ other"), "{s}");
+        assert!(s.contains("--shout"), "{s}");
+        assert!(s.contains("from ws just now · h to refresh"), "{s}");
+        assert!(s.contains("in ws"), "{s}");
+        assert_eq!(app.args.text, "--loud", "the run from the other worktree fills the args");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
 }

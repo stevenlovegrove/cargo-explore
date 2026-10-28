@@ -10,7 +10,11 @@ mod worker;
 use anyhow::{bail, Result};
 use app::{Action, App};
 use clap::Parser;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use ratatui::crossterm::{execute, terminal};
 use ratatui::DefaultTerminal;
 use std::io::Write;
 use std::path::PathBuf;
@@ -41,6 +45,26 @@ struct Cli {
     no_build: bool,
 }
 
+/// Starts the UI, asking the terminal to tell modified keys apart where it
+/// can (the kitty protocol), so that cmd-enter is seen as itself.
+fn init_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    if terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+    terminal
+}
+
+fn restore_terminal() {
+    if terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    ratatui::restore();
+}
+
 fn main() -> Result<()> {
     // Invoked as `cargo explore ...`, cargo passes "explore" as the first argument.
     let mut argv: Vec<String> = std::env::args().collect();
@@ -56,7 +80,8 @@ fn main() -> Result<()> {
     if cli.list {
         let ws = cargo::discover(&dir)?;
         for t in &ws.targets {
-            println!("{:<8} {:<30} {}", t.kind.label(), t.name, t.package);
+            let b = cargo::build_state(&ws.root, &ws.target_dir, t, false);
+            println!("{} {:<8} {:<30} {}", b.circle(), t.kind.label(), t.name, t.package);
         }
         return Ok(());
     }
@@ -74,9 +99,9 @@ fn main() -> Result<()> {
     worker::spawn(req_rx, resp_tx);
     let mut app = App::new(dir, state, req_tx);
 
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
     let result = run(&mut terminal, &mut app, &resp_rx);
-    ratatui::restore();
+    restore_terminal();
     app.state.save();
     result
 }
@@ -103,10 +128,11 @@ fn run(
         match app.handle_key(key) {
             Action::None => {}
             Action::Quit => return Ok(()),
-            Action::Run(argv) => {
-                ratatui::restore();
-                let quit = run_foreground(app, &argv);
-                *terminal = ratatui::init();
+            Action::Run { argv, env } => {
+                restore_terminal();
+                let quit = run_foreground(app, &argv, &env);
+                *terminal = init_terminal();
+                app.after_run();
                 if quit {
                     return Ok(());
                 }
@@ -117,11 +143,12 @@ fn run(
 
 /// Runs the command with the terminal handed over, then waits for the user.
 /// Returns true if the user asked to quit.
-fn run_foreground(app: &mut App, argv: &[String]) -> bool {
+fn run_foreground(app: &mut App, argv: &[String], env: &[(String, String)]) -> bool {
     let shown = shlex::try_join(argv.iter().map(String::as_str)).unwrap_or_else(|_| argv.join(" "));
     println!("\x1b[1;36m$ {shown}\x1b[0m   (in {})", app.dir.display());
     let status = Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(&app.dir)
         .status();
     let summary = match status {
@@ -141,19 +168,26 @@ fn describe(dir: &std::path::Path, name: &str, no_build: bool) -> Result<()> {
     let Some(t) = ws.targets.iter().find(|t| t.name == name) else {
         bail!("no bin or example named {name:?}; try --list");
     };
+    let sources = source::read_sources(&t.src_path);
     let h = if no_build {
-        source::scan(&t.src_path)
+        source::scan_sources(&sources)
     } else {
-        worker::describe(&ws.root, t)
+        worker::describe(&ws.root, t, false, help::Source::Help)
     };
     println!(
-        "{} ({} of {}) [{}]",
+        "{} ({} of {}) [from {}]",
         t.name,
         t.kind.label(),
         t.package,
-        match h.source {
-            help::Source::Help => "from --help",
-            help::Source::SourceScan => "from source scan",
+        h.source.label()
+    );
+    println!("parser: {}", source::parser_of(&sources, &t.deps));
+    println!(
+        "build:  {} (debug)",
+        match cargo::build_state(&ws.root, &ws.target_dir, t, false) {
+            cargo::BuildState::Unbuilt => "not built".to_string(),
+            cargo::BuildState::Fresh => "built, up to date".to_string(),
+            cargo::BuildState::Stale(p) => format!("built, then changed: {}", p[0].display()),
         }
     );
     if !h.about.is_empty() {
