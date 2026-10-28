@@ -240,11 +240,29 @@ impl App {
         })
     }
 
-    pub fn runs(&self) -> Vec<RunView> {
+    /// The past runs of the selected target, newest first.
+    pub fn past_runs(&self) -> Vec<RunView> {
         match (&self.ws, self.selected()) {
             (Some(ws), Some(t)) => self.state.runs(&ws.root, &t.key()),
             _ => Vec::new(),
         }
+    }
+
+    /// The rows of the runs pane: a run with no args first, always, then the
+    /// past runs with args.
+    pub fn runs(&self) -> Vec<RunView> {
+        if self.selected().is_none() {
+            return Vec::new();
+        }
+        let past = self.past_runs();
+        let bare = past.iter().find(|r| r.args.is_empty()).cloned();
+        let mut rows = vec![bare.unwrap_or(RunView {
+            args: String::new(),
+            when: 0,
+            other: None,
+        })];
+        rows.extend(past.into_iter().filter(|r| !r.args.is_empty()));
+        rows
     }
 
     pub fn selected_build(&self) -> Option<&BuildState> {
@@ -266,7 +284,7 @@ impl App {
         self.hist_nav = None;
         self.raw_scroll = 0;
         let root = self.ws.as_ref().unwrap().root.clone();
-        let last_args = self.runs().first().map(|r| r.args.clone()).unwrap_or_default();
+        let last_args = self.past_runs().first().map(|r| r.args.clone()).unwrap_or_default();
         self.args.set(&last_args);
         self.state.set_last_target(&root, &key);
         self.refresh_selected_build();
@@ -697,15 +715,6 @@ impl App {
         }
     }
 
-    /// The pane to the right of the targets: their runs, if any, else flags.
-    fn right_of_targets(&self) -> Focus {
-        if self.runs().is_empty() {
-            Focus::Flags
-        } else {
-            Focus::Runs
-        }
-    }
-
     fn key_targets(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
@@ -717,8 +726,7 @@ impl App {
             KeyCode::Char('/') => self.focus = Focus::Filter,
             KeyCode::Right | KeyCode::Char('l') => {
                 if self.selected().is_some() {
-                    self.focus = self.right_of_targets();
-                    self.run_sel = 0;
+                    self.enter_runs();
                 }
             }
             KeyCode::Enter => {
@@ -775,9 +783,6 @@ impl App {
                     self.state.save();
                     let n = self.runs().len();
                     self.run_sel = self.run_sel.min(n.saturating_sub(1));
-                    if n == 0 {
-                        self.focus = Focus::Targets;
-                    }
                 }
             }
             KeyCode::Esc | KeyCode::Left => {
@@ -822,18 +827,17 @@ impl App {
             }
             KeyCode::Enter => return self.run_action(false),
             KeyCode::Esc => self.focus = Focus::Targets,
-            KeyCode::Left => self.focus = self.right_of_targets_back(),
+            KeyCode::Left => self.enter_runs(),
             _ => return self.key_common(key).unwrap_or(Action::None),
         }
         Action::None
     }
 
-    /// Left of the flags: the runs, if any, else the targets.
-    fn right_of_targets_back(&self) -> Focus {
-        match self.right_of_targets() {
-            Focus::Runs => Focus::Runs,
-            _ => Focus::Targets,
-        }
+    /// Focuses the runs, on the row of the args shown, which are left as they are.
+    fn enter_runs(&mut self) {
+        let args = self.args.text.trim().to_string();
+        self.run_sel = self.runs().iter().position(|r| r.args == args).unwrap_or(0);
+        self.focus = Focus::Runs;
     }
 
     fn key_args(&mut self, key: KeyEvent) -> Action {
@@ -848,7 +852,7 @@ impl App {
             }
             KeyCode::BackTab => self.focus = Focus::Flags,
             KeyCode::Up | KeyCode::Down => {
-                let runs = self.runs();
+                let runs = self.past_runs();
                 if runs.is_empty() {
                     return Action::None;
                 }

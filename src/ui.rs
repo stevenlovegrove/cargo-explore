@@ -347,22 +347,17 @@ fn draw_runs(f: &mut Frame, app: &App, runs: &[crate::state::RunView], area: Rec
             } else {
                 Span::raw(r.args.clone())
             }];
-            spans.push(format!("  {}", ago(r.when)).italic());
+            if r.when > 0 {
+                spans.push(format!("  {}", ago(r.when)).italic());
+            }
             if let Some(o) = &r.other {
                 spans.push(format!("  in {}", short(o)).yellow());
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let block = pane(format!(" Recent runs ({}) ", runs.len()), focused);
-    if items.is_empty() {
-        f.render_widget(
-            Paragraph::new("none yet · ⏎ runs the command below".italic())
-                .block(block),
-            area,
-        );
-        return;
-    }
+    let recorded = runs.iter().filter(|r| r.when > 0 || !r.args.is_empty()).count();
+    let block = pane(format!(" Runs ({recorded} recent) "), focused);
     let list = List::new(items)
         .block(block)
         .highlight_style(highlight(focused));
@@ -636,10 +631,16 @@ mod tests {
         assert!(s.contains("⎇ main"), "{s}");
         assert!(rx.try_recv().is_err());
 
-        // Down to the example; right to its flags (no runs yet); right adds one.
+        // Down to the example; right to its runs, where a run with no args is
+        // always first; right again to its flags, and right adds one.
         key(&mut app, KeyCode::Down);
         assert_eq!(app.selected().unwrap().name, "hello");
         assert!(screen(&app).contains("std::env::args, by hand"));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.focus, crate::app::Focus::Runs);
+        assert!(screen(&app).contains("(no args)"));
+        let a = argv(key(&mut app, KeyCode::Enter));
+        assert_eq!(a, ["cargo", "run", "-p", "demo", "--example", "hello"]);
         key(&mut app, KeyCode::Right);
         assert_eq!(app.focus, crate::app::Focus::Flags);
         key(&mut app, KeyCode::Right);
@@ -657,10 +658,18 @@ mod tests {
         assert_eq!(a.last().unwrap(), "--loud");
         assert!(screen(&app).contains("⏎ $ cargo run -p demo --example hello -- --loud"));
 
-        // The run is recorded; left goes back to it, and up/down choose args.
+        // The runs are recorded, the one with no args still first; up to it
+        // clears the args.
         key(&mut app, KeyCode::Left);
         assert_eq!(app.focus, crate::app::Focus::Runs);
-        assert!(screen(&app).contains("Recent runs (1)"));
+        let s = screen(&app);
+        assert!(s.contains("Runs (2 recent)"), "{s}");
+        assert_eq!(app.runs()[0].args, "");
+        assert_eq!(app.runs()[1].args, "--loud");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.args.text, "");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.args.text, "--loud");
         key(&mut app, KeyCode::Left);
         assert_eq!(app.focus, crate::app::Focus::Targets);
 

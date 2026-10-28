@@ -49,7 +49,7 @@ which are those of its last run (in this worktree, else another) until changed.
 |----------|------|
 | Anywhere | `enter`, `cmd-enter` (also `ctrl-enter`, `alt-enter`, `F5`, `x`) run the command shown |
 | Targets  | `↑↓` select · `→` runs, then flags · `e` edit args · `X` run as built · `h` read `--help` · `u` read `-h` · `w` worktree · `/` filter · `r` debug/release · `v` raw help · `R` reload · `d` directory · `q` quit |
-| Recent runs | `↑↓` choose (fills the args) · `←→` panes · `e` edit · `del` forget |
+| Runs     | `↑↓` choose (fills the args; the first is always no args) · `←→` panes · `e` edit · `del` forget |
 | Flags    | `↑↓` select · `→`/`space` add to args · `e` edit args · `←` back |
 | Args     | `enter` run · `tab` complete a flag · `↑↓` recent runs · `ctrl-a/e/u/k/w` editing · `esc` back |
 | Worktrees | `↑↓` select · `enter`/`→` open · `esc`/`←` cancel |
